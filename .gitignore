@@ -1,0 +1,19 @@
+# Whitelist: only what is meant to be public. Everything else (SOF/Linux checkouts, traces, logs, recordings, private notes) stays local.
+/*
+!/.gitignore
+!/LICENSE
+!/README.md
+!/ohmydsp/
+!/tools/
+!/docs/
+build/
+__pycache__/
+.DS_Store
+*.wav
+*.raw
+*.bin
+*.ri
+*.ipc
+!ohmydsp/data/dmic-p10.ipc
+# private helpers
+/tools/remove-old-dmicprobe.sh

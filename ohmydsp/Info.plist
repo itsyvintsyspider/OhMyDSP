@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<key>CFBundleExecutable</key><string>OhMyDSP</string>
+	<key>CFBundleIdentifier</key><string>com.ohmydsp.OhMyDSP</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>OhMyDSP</string>
+	<key>CFBundlePackageType</key><string>KEXT</string>
+	<key>CFBundleShortVersionString</key><string>0.3.0</string>
+	<key>CFBundleVersion</key><string>0.3.0</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.kpi.iokit</key><string>9.0</string>
+		<key>com.apple.kpi.libkern</key><string>9.0</string>
+		<key>com.apple.kpi.mach</key><string>9.0</string>
+		<key>com.apple.kpi.bsd</key><string>9.0</string>
+		<key>com.apple.kpi.unsupported</key><string>8.0</string>
+		<key>com.apple.iokit.IOPCIFamily</key><string>2.9</string>
+		<key>com.apple.iokit.IOAudioFamily</key><string>200.5</string>
+		<key>as.vit9696.Lilu</key><string>1.6.0</string>
+	</dict>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>OhMyDSP</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>com.ohmydsp.OhMyDSP</string>
+			<key>IOClass</key><string>OhMyDSP</string>
+			<key>IOUserClientClass</key><string>OhMyDSPUserClient</string>
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<!-- device 06c8 / vendor 8086, audio class 0x0401xx (HD Audio w/ DSP) -->
+			<key>IOPCIMatch</key><string>0x06c88086</string>
+			<key>IOPCIClassMatch</key><string>0x04010000&amp;0xffff0000</string>
+			<!-- own category: matches alongside AppleHDAController instead of competing with it -->
+			<key>IOMatchCategory</key><string>OhMyDSP</string>
+			<key>IOProbeScore</key><integer>1</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>
