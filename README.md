@@ -1,4 +1,5 @@
-# OhMyDSP
+<p align="center"><img src="docs/images/icon.png" width="150" alt="OhMyDSP icon: a DSP chip with a sound waveform inside an orbit ring"></p>
+<h1 align="center">OhMyDSP</h1>
 
 Internal digital microphones (PDM DMIC behind the Intel audio DSP) for macOS on OpenCore hackintoshes, as a companion to AppleALC.
 
