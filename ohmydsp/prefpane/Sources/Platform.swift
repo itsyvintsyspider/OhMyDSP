@@ -4,10 +4,30 @@ import IOKit
 /// The machine's Intel PCH audio controller and what OhMyDSP can do with it. Read-only (IORegistry + sysctl), needs no privileges.
 struct DMICPlatform {
     enum Verdict { case supported, notYet, noSOF, dspOff, unknown }
+    struct Profile {
+        let controller: String
+        let codec: String
+        let dmicEndpoint: String
+        let subsystem: String
+        let ipc: String
+        let firmware: String
+    }
+
     let device: UInt16, pciClass: UInt16
     let name: String, verdict: Verdict
+    let profile: Profile?
+
+    static func setupActions(platform: DMICPlatform?, session: Bool, rplFiles: Bool,
+                             installed: Bool, busy: Bool) -> (install: Bool, uninstall: Bool) {
+        let available = !busy && platform?.device != 0x51ca && !session && !rplFiles
+        return (available && platform?.verdict == .supported, available && installed)
+    }
 
     var pciID: String { String(format: "8086:%04x", device) }
+    var profileSummary: String? {
+        guard let p = profile else { return nil }
+        return "codec \(p.codec), DMIC endpoint \(p.dmicEndpoint), \(p.ipc), firmware \(p.firmware)"
+    }
     var cpu: String {
         var n = 0; sysctlbyname("machdep.cpu.brand_string", nil, &n, nil, 0)
         var b = [CChar](repeating: 0, count: max(n, 1)); sysctlbyname("machdep.cpu.brand_string", &b, &n, nil, 0)
@@ -17,7 +37,11 @@ struct DMICPlatform {
     var problem: String? {
         switch verdict {
         case .supported: return nil
-        case .notYet: return "\(name) (\(pciID)) is not supported by the kernel extension yet."
+        case .notYet:
+            if device == 0x51ca {
+                return "\(name) (\(pciID)) uses Intel cAVS/IPC4. The preference pane can monitor the experimental IPC4 session; installation is managed by the RPL tools."
+            }
+            return "\(name) (\(pciID)) is not supported by the kernel extension yet."
         case .noSOF: return "\(name) (\(pciID)): Intel's Skylake/Kaby Lake DSP has no Sound Open Firmware, so OhMyDSP cannot drive it."
         case .dspOff: return "The audio DSP is switched off in the firmware setup (HDA mode). Enable the Intel DSP / HD Audio DSP option and restart."
         case .unknown: return "Unknown Intel audio controller (\(pciID)); not supported."
@@ -28,6 +52,7 @@ struct DMICPlatform {
     // decide which message the pane shows. A platform becomes .supported only after someone has tested it.
     private static let known: [UInt16: (String, Verdict)] = [
         0x06c8: ("Comet Lake-H", .supported),
+        0x51ca: ("Raptor Lake-P/U/H", .notYet),
         0x02c8: ("Comet Lake-LP", .notYet), 0x9dc8: ("Cannon Point-LP", .notYet), 0xa348: ("Cannon Point-H", .notYet),
         0x34c8: ("Ice Lake-LP", .notYet), 0xa0c8: ("Tiger Lake-LP", .notYet), 0x43c8: ("Tiger Lake-H", .notYet),
         0x4dc8: ("Jasper Lake", .notYet), 0x5a98: ("Apollo Lake", .notYet), 0x3198: ("Gemini Lake", .notYet),
@@ -35,6 +60,16 @@ struct DMICPlatform {
         0xa170: ("Sunrise Point-H (Skylake/Kaby Lake)", .noSOF), 0xa171: ("Sunrise Point-H (Skylake/Kaby Lake)", .noSOF),
         0xa2f0: ("Union Point (Kaby Lake)", .noSOF),
     ]
+
+    // Hardware inventory from the Lenovo 21JK004DCD system report. The endpoint
+    // and codec IDs are recorded here so diagnostics can distinguish a present
+    // DMIC from a controller with no digital-microphone wiring.
+    static func profile(device: UInt16, subsystemVendor: UInt32?, subsystemID: UInt32?) -> Profile? {
+        guard device == 0x51ca, subsystemVendor == 0x17aa, subsystemID == 0x50d1 else { return nil }
+        return Profile(controller: "8086:51ca", codec: "14f1:1f86 Senary Audio",
+                       dmicEndpoint: "8086:ae20 Intel Digital Microphone",
+                       subsystem: "17aa:50d1", ipc: "cAVS IPC4", firmware: "sof-ipc4/rpl/sof-rpl.ri")
+    }
 
     /// PCI class 0x0401 = audio controller with the DSP enabled (what the kext matches); 0x0403 = plain HD Audio, DSP hidden.
     static func detect() -> DMICPlatform? {
@@ -50,7 +85,9 @@ struct DMICPlatform {
             let id = UInt16(truncatingIfNeeded: dev)
             let k = known[id]
             let verdict: Verdict = k == nil ? .unknown : (cls == 0x0403 && k!.1 != .noSOF) ? .dspOff : k!.1
-            return DMICPlatform(device: id, pciClass: cls, name: k?.0 ?? "Intel audio controller", verdict: verdict)
+            return DMICPlatform(device: id, pciClass: cls, name: k?.0 ?? "Intel audio controller", verdict: verdict,
+                                profile: profile(device: id, subsystemVendor: word(s, "subsystem-vendor-id"),
+                                                 subsystemID: word(s, "subsystem-id")))
         }
     }
 

@@ -9,11 +9,10 @@ SOF firmware, builds the DMIC capture pipeline and exposes the result as a norma
 AppleALC, AppleHDA and AppleHDAController are never modified or hooked; OhMyDSP only touches the DSP path and uses its own DMA stream.
 
 > [!CAUTION]
-> **AI-assisted development.** This project was developed with substantial help from an AI coding assistant (Claude). The code has been
-> tested on one machine only, so review it before running it, especially the kernel extension.
+> **AI-assisted development.** This project was developed with substantial help from an AI coding assistant (Claude). Review it before running it, especially the kernel extension.
 
-> **Status: proof of concept, verified on one machine.** ThinkPad P1 Gen 3 (Comet Lake-H PCH, ALC285 + DMIC), macOS 15.8.2, OpenCore.
-> Other Intel platforms are untested, and the capture pipeline is still tied to that platform's topology (see [Compatibility](#compatibility)).
+> The original Comet Lake stack was verified on a ThinkPad P1 Gen 3 (ALC285 + DMIC) running macOS 15.8.2 with OpenCore. This revision passed builds and offline regression tests. A Comet Lake hardware retest is pending.
+> On the Lenovo Raptor Lake reference machine, the driver loaded automatically after reboot. The first CoreAudio recording returned the DSP to idle with zero HAL snapshot-failure frames, timestamp discontinuities or daemon overruns. See the [RPL startup and recording results](docs/2026-11-24-rpl-startup-loader.md#verified-baseline-after-the-snapshot-fix).
 > The software writes to PCI hardware registers. Test with a spare OpenCore USB and read [Safety](#safety).
 
 ## Preference pane
@@ -27,6 +26,13 @@ System Settings > Sound > Input with a live level meter:
 <p align="center"><img src="docs/images/sound-input.png" width="520" alt="System Settings, Sound, Input list with Internal Microphone (DMIC) selected and the input level moving"></p>
 
 A System Settings pane (**OhMyDSP**, bottom of the sidebar) in the standard Apple style (grouped cards, semantic colours, light and dark).
+
+The local Raptor Lake IPC4 build now supports **status monitoring** in this pane:
+verified RPL firmware/graph, exact session bundle, DSP idle/recording/fault state,
+and the current boot's startup-loader result. A visible HAL alone is not reported
+as a ready microphone. RPL Install/Reinstall/Uninstall remain disabled; use the
+validated RPL tools for deployment. See [RPL system input](docs/2026-11-24-rpl-startup-loader.md).
+
 
 | Section | What it does |
 |---|---|
@@ -150,7 +156,13 @@ The pane downloads the Sound Open Firmware image itself from the official [sof-b
 (`sof/intel-signed/sof-cnl.ri`, also the Comet Lake image; the unsigned `community/` build does not work). Both the download and the extracted file are
 checked against pinned SHA-256 values, and the installer re-checks the installed copy. The firmware is Intel's, under its own licence
 (`LICENCE.Intel`, installed next to it); it is never stored in this repository.
+For the local Raptor Lake machine, sof-bin also provides an Intel-signed IPC4 image at
+`sof-ipc4/rpl/intel-signed/sof-rpl.ri`. Separate manual experimental tools use this image with recovered NHLT and IPC4 topology controls. Short on-demand sessions and the first CoreAudio recording after reboot passed on the reference machine. Use the [CoreAudio stability tools](docs/coreaudio-stability-tools.md) for repeatable qualification; the preference pane supports RPL status monitoring, while RPL installation/removal remains separate work.
 The DMIC pipeline blob `ohmydsp/data/dmic-p10.ipc` is generated from the SOF topology with `tools/gen-ipc3-dmic.py` (see its header) and bundled into the pane.
+The Comet Lake clock and silent-recovery changes in this revision are covered by builds and offline regression tests. A new hardware run on the reference ThinkPad is pending. The compatibility table records the earlier hardware results.
+
+The RPL capture-DMA probe reports frame movement, elapsed time and cleanup status. To collect audio explicitly, use the administrator-only `ipc4-session-test` with the IPC4Session build. The PCM1 decoder remains available for archived captures.
+
 A later version will build the pipeline from the machine's NHLT table instead.
 
 ## Compatibility
@@ -158,6 +170,7 @@ A later version will build the pipeline from the machine's NHLT table instead.
 | Platform | Status |
 |---|---|
 | Comet Lake-H (ThinkPad P1 Gen 3, `8086:06c8`), one working DMIC | **Works** (capture, recovery, sleep/wake) |
+| Raptor Lake (`8086:51ca`, Lenovo 21JK004DCD) | **Experimental system input verified in short sessions on this machine.** IPC4 capture and the CoreAudio input path recorded speech with successful repeated startup/cleanup. Long-session, multi-client and sleep/wake qualification remain pending; this is not general RPL support. See [system-input results](docs/2026-11-24-rpl-startup-loader.md#verified-baseline-after-the-snapshot-fix). The Comet Lake IPC3 profile remains unsuitable. |
 | Other Intel cAVS 1.5 / 1.8 / 2.x laptops | Untested. PCI ID matching, register layout and the pipeline are still specific to the above |
 | Skylake / Kaby Lake (e.g. ThinkPad X1 Carbon 6th Gen) | **Not possible**: Intel's DSP there has no Sound Open Firmware. The pane detects it and says so |
 
@@ -171,11 +184,11 @@ output and headset stay on AppleALC; the first DSP start after a failed boot may
 
 The kext writes to the HDA/DSP PCI function (never to codec verbs, CORB/RIRB or any stream AppleHDA uses) and polls instead of using interrupts.
 A bad build can hang boot. Keep a working OpenCore USB, test with the kill switch `-ohmydspoff` in mind, load manually before injecting.
-No audio is ever stored by the software; recordings are only made by the apps you use.
+Apps using the microphone control their own recordings. Treat archived PCM1 captures and samples saved with `ipc4-session-test` as recordings and keep them out of source control.
 
 ## Documentation
 
-Every experiment has a dated note in [docs/](docs/): the Linux/SOF bring-up recipe ([bringup-recipe.md](docs/bringup-recipe.md)), the phase plans and the
+Earlier bring-up experiments are documented in [docs/](docs/): the Linux/SOF bring-up recipe ([bringup-recipe.md](docs/bringup-recipe.md)), the phase plans and the
 results of each step.
 
 ## Credits and licence
