@@ -1,0 +1,8 @@
+351981406712a5751347a04829b01acdd60a0430c3049420b7c5dd28158ca2bc  /Library/Application Support/OhMyDSP/ohmydspd
+351325786e53ca7cd23ffc1462d82913f3e0c08ad78f89053d85e4b6703cf12b  /Library/Application Support/OhMyDSP/rpl/sof-rpl.ri
+4cb92661b2969e2d9bf394b31945a75a54827204db60575b4ca8dde4f72e2236  /Library/Application Support/OhMyDSP/rpl/rpl-dmic.i4pc
+b8ab06b9dc66fe34f3b3f0903c1f8b3726b1c94f42e8a12e8f41877a1fa4b1d8  /Library/LaunchDaemons/com.ohmydsp.daemon.plist
+7daadfa6aa266b80cb532bdec63091c1d720aed834995125fabd9206fa809892  /Library/Audio/Plug-Ins/HAL/OhMyDSP.driver/Contents/Info.plist
+dabf7b073fb910dd049e215311473e435c0bb5f3b8579bb38cd167cdad723481  /Library/Audio/Plug-Ins/HAL/OhMyDSP.driver/Contents/MacOS/OhMyDSPDriver
+c2f89a0aa96756680bcabeff8ea6a2091dd3a4d7c04dd4a056a86a16832f7779  /Library/Application Support/dmic-macos/kext/rpl-manual-ipc4-session/OhMyDSP.kext/Contents/Info.plist
+92c47e65f80e071a968a3f20e5ca61037a350acb2e0972bfde8f7605463deb4a  /Library/Application Support/dmic-macos/kext/rpl-manual-ipc4-session/OhMyDSP.kext/Contents/MacOS/OhMyDSP
