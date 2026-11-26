@@ -28,10 +28,24 @@ void OhMyDSP::record(const char *fmt, ...)
     char line[300];
     va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof(line), fmt, ap); va_end(ap);
     IOLog("OhMyDSP: %s\n", line);
-    if (!logBuf) logBuf = OSArray::withCapacity(256);
-    if (!logBuf || logBuf->getCount() >= 1000) return;
+    if (stateLock) IOLockLock(stateLock);
+    if (!logBuf) logBuf = OSArray::withCapacity(4096);
+    // The IPC4 capture probe logs each mailbox word so a single NHLT module
+    // init can consume hundreds of entries.  Keep enough history for the
+    // complete run; if a future experiment exceeds the bound, expose that
+    // fact in the registry instead of silently presenting a partial result.
+    if (!logBuf || logBuf->getCount() >= 4096) {
+        if (!logTruncated) {
+            logTruncated = true;
+            setProperty("phase1-log-truncated", true);
+            IOLog("OhMyDSP: phase1 log capacity reached; subsequent lines are not retained\n");
+        }
+        if (stateLock) IOLockUnlock(stateLock);
+        return;
+    }
     OSString *s = OSString::withCString(line);
     if (s) { logBuf->setObject(s); s->release(); }
+    if (stateLock) IOLockUnlock(stateLock);
     // NOTE: logBuf must never be handed to setProperty() while we still append to it (panics: "Trying to change a
     // collection in the registry"). It is published once, as a copy, by publishLog().
 }
@@ -55,9 +69,60 @@ static void probeEntry(thread_call_param_t p0, thread_call_param_t)
 
 void OhMyDSP::publishLog()
 {
-    if (!logBuf) return;
-    OSArray *copy = OSArray::withArray(logBuf);
+    if (stateLock) IOLockLock(stateLock);
+    OSArray *copy = logBuf ? OSArray::withArray(logBuf) : nullptr;
+    UInt32 count = logBuf ? logBuf->getCount() : 0;
+    bool truncated = logTruncated;
+    if (stateLock) IOLockUnlock(stateLock);
     if (copy) { setProperty("phase1-log", copy); copy->release(); }
+    setProperty("phase1-log-count", (unsigned long long)count, 32);
+    setProperty("phase1-log-truncated", truncated);
+}
+
+bool OhMyDSP::claimClient(OhMyDSPUserClient *c)
+{
+    if (!stateLock) return false;
+    IOLockLock(stateLock);
+    bool available = !client;
+    if (available) client = c;
+    IOLockUnlock(stateLock);
+    return available;
+}
+
+void OhMyDSP::releaseClient(OhMyDSPUserClient *c)
+{
+    if (!stateLock) return;
+    IOLockLock(stateLock);
+    if (client == c) client = nullptr;
+    IOLockUnlock(stateLock);
+}
+
+void OhMyDSP::captureLog(const char *state, bool begin)
+{
+    if (begin) {
+        IOLockLock(stateLock);
+        if (logBuf) logBuf->release();
+        logBuf = nullptr; logTruncated = false; sessionNumber++;
+        IOLockUnlock(stateLock);
+        removeProperty("ipc4-mtrace-stream");
+    }
+    LOG("IPC4 session %u: %s", sessionNumber, state);
+    setProperty("ipc4-session-number", (unsigned long long)sessionNumber, 32);
+    setProperty("ipc4-session-state", state);
+    publishLog();
+    if (!begin && dsp && dsp->ipc4TraceData())
+        setProperty("ipc4-mtrace-stream", dsp->ipc4TraceData(), dsp->ipc4TraceSize());
+    if (!begin) {
+        char key[64];
+        snprintf(key, sizeof(key), "ipc4-session-slot%u-log", sessionNumber % 4);
+        OSObject *snapshot = copyProperty("phase1-log");
+        if (snapshot) { setProperty(key, snapshot); snapshot->release(); }
+        snprintf(key, sizeof(key), "ipc4-session-slot%u-number", sessionNumber % 4);
+        setProperty(key, (unsigned long long)sessionNumber, 32);
+        snprintf(key, sizeof(key), "ipc4-session-slot%u-trace", sessionNumber % 4);
+        if (dsp && dsp->ipc4TraceData()) setProperty(key, dsp->ipc4TraceData(), dsp->ipc4TraceSize());
+        else removeProperty(key);
+    }
 }
 
 void OhMyDSP::runProbe()
@@ -69,20 +134,24 @@ void OhMyDSP::runProbe()
 
 bool OhMyDSP::start(IOService *provider)
 {
+    stateLock = IOLockAlloc();
+    if (!stateLock) return false;
     ohmydspLoadConfig();
     if (gCfg.off) { IOLog("OhMyDSP: -ohmydspoff set, not starting\n"); return false; }
     if (gLiluState == LiluRefused) { IOLog("OhMyDSP: Lilu refused the load (boot policy), not starting\n"); return false; }
-    if (!super::start(provider)) return false;
+    IOLog("OhMyDSP: start provider=%s\n", provider ? provider->getName() : "(null)");
+    if (!super::start(provider)) { IOLog("OhMyDSP: super::start failed\n"); return false; }
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
-    if (!pci) return false;
+    if (!pci) { IOLog("OhMyDSP: provider is not IOPCIDevice, refusing\n"); return false; }
     tcall = thread_call_allocate(probeEntry, (thread_call_param_t)this);
     if (!tcall) return false;
     pci->retain(); pciDev = pci;
     uint64_t dl; clock_interval_to_deadline((uint32_t)gCfg.delay, NSEC_PER_SEC, &dl);   // seconds after start() before the probe runs (ohmydsp_delay)
     thread_call_enter_delayed(tcall, dl);
     registerService();
+    IOLog("OhMyDSP: matched PCI provider and scheduled delayed probe\n");
     // Phase 5.1: audio device on a synthetic tone source (no DSP, no register access)
-#ifndef OHMYDSP_CORE
+#if !defined(OHMYDSP_CORE) && !defined(OHMYDSP_RPL_EXPERIMENTAL)
     if (gCfg.audio == 1) {
         audioDev = new OhMyDSPAudioDevice;
         if (audioDev && audioDev->init(NULL) && audioDev->attach(this)) {
@@ -123,6 +192,144 @@ void OhMyDSP::runProbe(IOPCIDevice *pci)
               logDsp((volatile UInt8 *)m4->getVirtualAddress(), (size_t)m4->getLength()); }
     else LOG("BAR4 map failed");
 
+#ifdef OHMYDSP_RPL_EXPERIMENTAL
+#ifdef OHMYDSP_RPL_IPC4_SESSION
+    bool ready = m0 && m4 && startLiveAudio(pci, m0, m4);
+    setProperty("ipc4-session-ready", ready);
+    LOG("RPL IPC4 on-demand session %s; no boot-time recording", ready ? "ready" : "FAILED");
+    if (m0) m0->release();
+    if (m4) m4->release();
+    return;
+#endif
+#ifdef OHMYDSP_RPL_LIVE
+#ifdef OHMYDSP_RPL_MANUAL
+    int rplLive = 1;
+#else
+    int rplLive = 0;
+    PE_parse_boot_argn("ohmydsp_rpl_live", &rplLive, sizeof(rplLive));
+#endif
+    if (rplLive == 1 && m0 && m4) {
+        // Discovery keeps the firmware-only boundary.  The probe build adds
+        // one reviewed IPC4 round trip after the same mailbox dump.
+#ifdef OHMYDSP_RPL_DISCOVER
+        LOG("RPL LIVE discovery gate enabled: firmware boot plus IPC4 mailbox dump; pipeline disabled");
+#elif defined(OHMYDSP_RPL_IPC4_PROBE)
+        LOG("RPL LIVE IPC4 probe gate enabled: one pipeline-create round trip; capture disabled");
+#elif defined(OHMYDSP_RPL_IPC4_MODULE_PROBE)
+        LOG("RPL LIVE IPC4 module probe gate enabled: NHLT-backed module init; bind/capture disabled");
+#elif defined(OHMYDSP_RPL_IPC4_BIND_PROBE)
+        LOG("RPL LIVE IPC4 bind probe gate enabled: NHLT-backed module init and bind; capture disabled");
+#elif defined(OHMYDSP_RPL_IPC4_CAPTURE_PROBE)
+        LOG("RPL LIVE IPC4 capture probe gate enabled: NHLT-backed graph and pipeline-state probe; HDA DMA disabled");
+#elif defined(OHMYDSP_RPL_IPC4_CAPTURE_DMA_PROBE)
+        LOG("RPL LIVE IPC4 capture-DMA probe gate enabled: SD5 only, short HDA DMA, no IOAudio device");
+#else
+        LOG("RPL LIVE gate enabled: firmware-only boot attempt; IPC4 pipeline disabled");
+#endif
+        DSPDevice rpl(pci, (volatile UInt8 *)m0->getVirtualAddress(), (size_t)m0->getLength(),
+                      (volatile UInt8 *)m4->getVirtualAddress(), (size_t)m4->getLength(), false, dspLog, this);
+        bool ok = rpl.checkIdle() && rpl.loadFirmware();
+        if (ok) ok = rpl.powerUp(
+#if defined(OHMYDSP_RPL_DISCOVER) || defined(OHMYDSP_RPL_IPC4_PROBE) || defined(OHMYDSP_RPL_IPC4_MODULE_PROBE) || defined(OHMYDSP_RPL_IPC4_BIND_PROBE)
+            true
+#else
+            false
+#endif
+        );
+#ifdef OHMYDSP_RPL_IPC4_PROBE
+        if (ok) ok = rpl.sendIpc4Probe();
+#endif
+#ifdef OHMYDSP_RPL_IPC4_MODULE_PROBE
+        if (ok) ok = rpl.loadPipelineBlob();
+        if (ok) ok = rpl.sendPipeline(9);
+#endif
+#ifdef OHMYDSP_RPL_IPC4_BIND_PROBE
+        if (ok) ok = rpl.loadPipelineBlob();
+        if (ok) ok = rpl.sendPipeline(15);
+#endif
+#ifdef OHMYDSP_RPL_IPC4_CAPTURE_DMA_PROBE
+        bool ipc4Graph = false;
+        bool ipc4Prepared = false;
+        bool ipc4Trace = false;
+        if (ok) ok = rpl.loadPipelineBlob();
+        if (ok) ok = rpl.beginIpc4TraceCapture();
+        if (ok) rpl.setIpc4TracePhase(1); // graph and initial PAUSED
+        if (ok) { ipc4Graph = true; ok = rpl.sendIpc4CaptureGraph(5); }
+        // Preserve run-9 transition order for this diagnostic experiment.
+        // Initial PAUSED source-to-sink is NOT an exact Linux START match.
+        // Descriptor setup leaves SD RUN clear until RUNNING succeeds.
+        if (ok && ipc4Graph) ok = rpl.sendIpc4PipelineStateMulti(DSPDevice::IPC4_STATE_PAUSED, 0, 1, "IPC4 capture pipelines 12,11 PAUSED");
+        if (ok && ipc4Graph) { ok = rpl.setupIpc4CaptureStream(5); ipc4Prepared = ok; }
+        // The backend buffers from boot even before ENABLE_LOGS. The host
+        // now consumes it throughout graph IPC; late enable arms notifications.
+        if (ok && ipc4Prepared) {
+            LOG("IPC4 capture: observing SD5 for 1000 ms");
+            rpl.setIpc4TracePhase(2); // enable log notifications
+            ipc4Trace = true; // Disable even if the enable reply timed out.
+            ok = rpl.setIpc4Trace(true);
+        }
+        // SOF sends IPC4 RUNNING first; only after that succeeds does the
+        // platform trigger HDA DMA.  Keep that ordering explicit so an
+        // invalid RUNNING transition cannot leave an active stream behind.
+        if (ok && ipc4Prepared) {
+            rpl.setIpc4TracePhase(3); // RUNNING and optional DMA observation
+            ok = rpl.sendIpc4PipelineStateMulti(DSPDevice::IPC4_STATE_RUNNING, 1, 0, "IPC4 capture pipelines 11,12 RUNNING");
+        }
+        if (ok && ipc4Prepared) ok = rpl.startIpc4CaptureDma();
+        if (ok && ipc4Prepared) ok = rpl.observeIpc4CaptureStream(1000);
+        bool clean = rpl.finishIpc4CaptureProbe(ipc4Graph, ipc4Trace);
+        if (rpl.ipc4TraceData())
+            setProperty("ipc4-mtrace-stream", rpl.ipc4TraceData(), rpl.ipc4TraceSize());
+        ok = ok && clean;
+#endif
+#ifdef OHMYDSP_RPL_IPC4_CAPTURE_PROBE
+        if (ok) ok = rpl.loadPipelineBlob();
+        if (ok) ok = rpl.sendPipeline(15);
+        // IPC4 starts the host-facing pipeline first, then the DMIC pipeline.
+        // This state-only pass exercises graph preparation without programming
+        // an HDA stream or starting capture DMA.
+        if (ok) ok = rpl.sendIpc4PipelineState(1, 3, "IPC4 pipeline 11 PAUSED");
+        if (ok) ok = rpl.sendIpc4PipelineState(0, 3, "IPC4 pipeline 12 PAUSED");
+        if (ok) ok = rpl.sendIpc4PipelineState(0, 2, "IPC4 pipeline 12 RESET");
+        if (ok) ok = rpl.sendIpc4PipelineState(1, 2, "IPC4 pipeline 11 RESET");
+#endif
+#ifndef OHMYDSP_RPL_IPC4_CAPTURE_DMA_PROBE
+        rpl.teardown(false);
+#endif
+        LOG("RPL LIVE result: %s", ok ? "PASS" : "FAILED");
+        if (m0) m0->release();
+        if (m4) m4->release();
+        LOG("probe done (RPL %s)",
+#ifdef OHMYDSP_RPL_DISCOVER
+            "IPC4 mailbox discovery"
+#elif defined(OHMYDSP_RPL_IPC4_PROBE)
+            "IPC4 transport probe"
+#elif defined(OHMYDSP_RPL_IPC4_MODULE_PROBE)
+            "IPC4 NHLT-backed module probe"
+#elif defined(OHMYDSP_RPL_IPC4_BIND_PROBE)
+            "IPC4 NHLT-backed bind probe"
+#elif defined(OHMYDSP_RPL_IPC4_CAPTURE_DMA_PROBE)
+            "IPC4 capture DMA probe"
+#elif defined(OHMYDSP_RPL_IPC4_CAPTURE_PROBE)
+            "IPC4 capture pipeline-state probe"
+#else
+            "firmware-only"
+#endif
+        );
+        return;
+    }
+    if (rplLive == 1) LOG("RPL LIVE requested but BAR mapping is incomplete; refusing firmware boot");
+#endif
+    // The first Raptor Lake build is deliberately read-only. It validates PCI/BAR
+    // visibility and captures diagnostics, but never starts firmware, IPC, DMA,
+    // an IOAudioFamily device, or a user-client capture session.
+    LOG("RPL experimental build: read-only probe complete; firmware/IPC/DMA/audio disabled");
+    if (m0) m0->release();
+    if (m4) m4->release();
+    LOG("probe done (RPL read-only)");
+    return;
+#endif
+
     // Phase 5.3 (boot-arg ohmydsp_audio=2): live microphones. The audio engine owns the DSP (power-up on engine start), the Phase 2-4 harness is not used.
     // Phase 2 (DSP power-up + firmware load) only when explicitly requested by boot-arg; see docs/phase2-plan.md.
     const int au = gCfg.audio;
@@ -150,14 +357,19 @@ void OhMyDSP::runProbe(IOPCIDevice *pci)
 // session that the user client talks to. The DSP itself is powered up only when the client starts the stream.
 bool OhMyDSP::startLiveAudio(IOPCIDevice *pci, IOMemoryMap *m0, IOMemoryMap *m4)
 {
-    const UInt32 LIVE_RING_BYTES = (UInt32)gCfg.ringKiB * 1024;
+    const UInt32 LIVE_RING_BYTES =
+#ifdef OHMYDSP_RPL_IPC4_SESSION
+        DSPDevice::CAPTURE_BYTES;
+#else
+        (UInt32)gCfg.ringKiB * 1024;
+#endif
     DSPDevice *d = new DSPDevice(pci, (volatile UInt8 *)m0->getVirtualAddress(), (size_t)m0->getLength(),
                                  (volatile UInt8 *)m4->getVirtualAddress(), (size_t)m4->getLength(), false, dspLog, this);
     if (!d) return false;
     if (!(d->checkIdle() && d->setCaptureBytes(LIVE_RING_BYTES) && d->loadPipelineBlob() && d->loadFirmware() && d->allocStreamBuffers())) {
         LOG("live capture: preparation failed (see the lines above), no capture session"); delete d; return false; }
     OhMyDSPCapture *c = new OhMyDSPCapture;
-    if (!c || !c->setup(d)) { LOG("live capture: session setup failed"); if (c) c->release(); d->releaseStreamBuffers(); delete d; return false; }
+    if (!c || !c->setup(d, this)) { LOG("live capture: session setup failed"); if (c) c->release(); d->releaseStreamBuffers(); delete d; return false; }
     dsp = d; cap = c; m0->retain(); m4->retain(); map0 = m0; map4 = m4;
     LOG("live capture ready: DSP idle, powers up when the user client starts the stream");
     return true;
@@ -181,6 +393,12 @@ bool OhMyDSP::startLiveAudio(IOPCIDevice *pci, IOMemoryMap *m0, IOMemoryMap *m4)
     return true;
 }
 #endif
+
+void OhMyDSP::free()
+{
+    if (stateLock) { IOLockFree(stateLock); stateLock = nullptr; }
+    super::free();
+}
 
 void OhMyDSP::stop(IOService *provider)
 {

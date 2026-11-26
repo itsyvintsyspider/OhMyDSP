@@ -15,8 +15,11 @@
 // ---- constants (docs/bringup-recipe.md section 2; sof-linux intel/hda.h) ----
 enum : UInt32 {
     ADSPCS = 0x04,
-    HIPCTDR = 0xC0, HIPCTDA = 0xC4, HIPCIDR = 0xD0, HIPCIDA = 0xD4,
+    HIPCTDR = 0xC0, HIPCTDA = 0xC4, HIPCTDD = 0xC8,
+    HIPCIDR = 0xD0, HIPCIDA = 0xD4, HIPCIDD = 0xD8,
     ROM_STATUS = 0x80000, ROM_ERROR = 0x80004, MBOX_UPLINK = 0x81000,
+    IPC4_OUTBOX = 0xA0000, IPC4_DEBUG = 0xC0000, IPC4_MAX_PAYLOAD = 4096,
+    IPC4_REPLY_DIR = 1u << 29, IPC4_REPLY_STATUS = 0x00FFFFFF,
     BIT31 = 0x80000000u,
     ROM_IPC_CONTROL = 0x01000000, ROM_IPC_PURGE_FW = 0x00004000, ROM_STREAM_SHIFT = 9,
     FSR_MASK = 0x00FFFFFF, FSR_INIT_DONE = 1, FSR_FW_ENTERED = 5,
@@ -28,12 +31,24 @@ enum : UInt32 {
     HDA_CL_STREAM_FORMAT = 0x40,
     EM2 = 0x1030, EM2_L1SEN = 1u << 13,
     PCI_PGCTL = 0x44, PGCTL_ADSPPGD = 1u << 2, PCI_CGCTL = 0x48, CGCTL_ADSPDCGE = 1u << 1,
+#ifdef OHMYDSP_RPL_LIVE
+    FW_SIZE_EXPECTED = 707036, PAYLOAD_OFF = 0x9dc,
+#else
     FW_SIZE_EXPECTED = 557824, PAYLOAD_OFF = 0x300,
+#endif
     STREAM_INDEX = 8, STREAM_TAG = 2,       // free playback descriptor SD8 (Phase 1 log); AppleHDA uses out SD7 tag 1
     P4_PERIOD = DSPDevice::CAPTURE_PERIOD, P4_FMT = 0x0041, P4_COMP_HOST = 50,
 };
+#ifdef OHMYDSP_RPL_LIVE
+static const char *kFwPath = "/Library/Application Support/OhMyDSP/rpl/sof-rpl.ri";
+#else
 static const char *kFwPath = "/Library/Application Support/OhMyDSP/sof-cnl.ri";
+#endif
+#if defined(OHMYDSP_RPL_IPC4_MODULE_PROBE) || defined(OHMYDSP_RPL_IPC4_BIND_PROBE) || defined(OHMYDSP_RPL_IPC4_CAPTURE_PROBE) || defined(OHMYDSP_RPL_IPC4_CAPTURE_DMA_PROBE) || defined(OHMYDSP_RPL_IPC4_SESSION)
+static const char *kBlobPath = "/Library/Application Support/OhMyDSP/rpl/rpl-dmic.i4pc";
+#else
 static const char *kBlobPath = "/Library/Application Support/OhMyDSP/dmic-p10.ipc";
+#endif
 
 static inline UInt32 r32(volatile UInt8 *b, UInt32 o) { return *(volatile UInt32 *)(b + o); }
 static inline UInt16 r16(volatile UInt8 *b, UInt32 o) { return *(volatile UInt16 *)(b + o); }
@@ -66,6 +81,7 @@ void DSPDevice::releaseStreamBuffers()
 
 DSPDevice::~DSPDevice()
 {
+    if (traceArchive) IOFree(traceArchive, TRACE_ARCHIVE_CAPACITY);
     if (!stuck) freeBuffers(pb);   // a stream whose RUN bit could not be cleared keeps its buffers (deliberate leak, see freeStream)
     if (fwCmd) { fwCmd->clearMemoryDescriptor(); fwCmd->release(); }
     if (bdlCmd) { bdlCmd->clearMemoryDescriptor(); bdlCmd->release(); }
@@ -256,19 +272,31 @@ bool DSPDevice::loadPipelineBlob()
 {
     if (!loadFile(kBlobPath, 16384, &ipcBlob)) { LOG("ABORT: Phase 3 blob not available"); return false; }
     const UInt8 *bp = (const UInt8 *)ipcBlob->getBytesNoCopy(); UInt32 bl = ipcBlob->getLength(), pos = 8;
+    bool isIpc4 = bl >= 8 && memcmp(bp, "I4PC", 4) == 0;
+#ifdef OHMYDSP_RPL_LIVE
+    bool good = isIpc4;
+#else
     bool good = bl >= 8 && memcmp(bp, "DIPC", 4) == 0;
+#endif
     UInt32 cnt = good ? *(const UInt32 *)(bp + 4) : 0;
     if (cnt == 0 || cnt > 64) good = false;
     for (UInt32 i = 0; good && i < cnt; i++) {
         if (pos + 8 > bl) { good = false; break; }
         UInt32 len = *(const UInt32 *)(bp + pos);
-        if (len < 12 || len > 384 || pos + 8 + ((len + 3) & ~3u) > bl || *(const UInt32 *)(bp + pos + 8) != len) { good = false; break; }  // hdr.size == len
-        ipcOff[i] = pos; pos += 8 + ((len + 3) & ~3u);
+        if (isIpc4) {
+            // I4PC record: {u32 byte_len, u32 extension, u32 primary, payload...}.
+            if (len < 12 || len > IPC4_MAX_PAYLOAD || pos + ((len + 3) & ~3u) > bl) { good = false; break; }
+            ipcOff[i] = pos;
+            pos += (len + 3) & ~3u;
+        } else {
+            if (len < 12 || len > 384 || pos + 8 + ((len + 3) & ~3u) > bl || *(const UInt32 *)(bp + pos + 8) != len) { good = false; break; }  // hdr.size == len
+            ipcOff[i] = pos; pos += 8 + ((len + 3) & ~3u);
+        }
     }
     if (good && pos != bl) good = false;
-    LOG("Phase 3 blob: %u messages, %u bytes -> %s", cnt, bl, good ? "OK" : "BAD");
+    LOG("Phase %s blob: %u messages, %u bytes -> %s", isIpc4 ? "IPC4" : "3", cnt, bl, good ? "OK" : "BAD");
     if (!good) { ipcBlob->release(); ipcBlob = nullptr; return false; }
-    ipcCount = cnt;
+    ipcCount = cnt; ipc4Blob = isIpc4;
     return true;
 }
 
@@ -290,10 +318,15 @@ bool DSPDevice::loadFirmware()
         vnode_close(vp, FREAD, ctx);
         if (err || resid) { LOG("ABORT: firmware read failed (err %d resid %d)", err, resid); if (tmp) IOFree(tmp, FW_SIZE_EXPECTED); return false; }
         UInt32 magic = *(UInt32 *)tmp, full = *(UInt32 *)(tmp + 4);
+#ifdef OHMYDSP_RPL_LIVE
+        bool good = memcmp(tmp, "$AE1", 4) == 0 && full == PAYLOAD_OFF && memcmp(tmp + PAYLOAD_OFF, "$CPD", 4) == 0;
+#else
         bool good = magic == 0x6e614d58 && full == PAYLOAD_OFF && memcmp(tmp + PAYLOAD_OFF, "$CPD", 4) == 0;
+#endif
         LOG("firmware: magic=0x%08x ext_man_size=0x%x payload[0..3]=%02x%02x%02x%02x -> %s", magic, full,
             tmp[PAYLOAD_OFF], tmp[PAYLOAD_OFF + 1], tmp[PAYLOAD_OFF + 2], tmp[PAYLOAD_OFF + 3], good ? "OK" : "BAD");
         if (!good) { IOFree(tmp, FW_SIZE_EXPECTED); return false; }
+ #ifndef OHMYDSP_RPL_LIVE
         {   // window table from the extended manifest (SOF_EXT_MAN_ELEM_WINDOW=1), as Linux does in ipc3_get_windows (ipc3.c:647)
             // layout: ext_man header {magic, full_size, header_size, version}; elems {type, size, sof_ipc_window{ext_hdr(12), num, elem[24 B]}}
             // window elem: hdr(4) type id flags size offset (24 B); BAR4 offset = 0x80000 + id * 0x20000 + offset (SRAM_WINDOW_OFFSET)
@@ -315,6 +348,21 @@ bool DSPDevice::loadFirmware()
                 pos += es;
             }
         }
+ #else
+        // IPC4 on cAVS 2.5 uses fixed windows.  The IPC3 FW_READY extension
+        // fields are zero on this image and must not be used as offsets.
+        if (len4 < IPC4_OUTBOX + IPC4_MAX_PAYLOAD || len4 < MBOX_UPLINK + IPC4_MAX_PAYLOAD) {
+            LOG("ABORT: BAR4 too small for fixed IPC4 windows (len=0x%zx)", len4);
+            IOFree(tmp, FW_SIZE_EXPECTED);
+            return false;
+        }
+        downbox = IPC4_OUTBOX;
+        downSize = 0x20000;       // complete window 1, bounded sends use IPC4_MAX_PAYLOAD
+        upbox = MBOX_UPLINK;
+        upSize = IPC4_MAX_PAYLOAD;
+        LOG("RPL IPC4 fixed windows: uplink=0x%05x size=0x%x outbox=0x%05x window=0x%x payload-limit=0x%x",
+            upbox, upSize, downbox, downSize, IPC4_MAX_PAYLOAD);
+ #endif
         fwFile = OSData::withBytes(tmp + PAYLOAD_OFF, payload);   // only the stripped payload is DMA'd
         IOFree(tmp, FW_SIZE_EXPECTED);
         if (!fwFile) { LOG("ABORT: out of memory"); return false; }
@@ -417,10 +465,19 @@ bool DSPDevice::powerUp(bool dumpMailbox)
         W0(spibBase + 0x08 + 0x08 * STREAM_INDEX, payload, "SPIB[8] = fw size");
     }
 
-    // step 7: power up cores 0-3, poll CPA
+    // step 7: power up the host-managed cores, poll CPA. cAVS 2.5
+    // platforms used by SOF's TGL/ADL path expose only core 0 to the host.
     dspPowered = true;
-    U4(ADSPCS, CORES_ALL << 16, CORES_ALL << 16, "ADSPCS: SPA cores0-3");
-    if (!poll(b4, ADSPCS, CORES_ALL << 24, CORES_ALL << 24, 50, "CPA cores0-3")) return false;
+#ifdef OHMYDSP_RPL_LIVE
+    const UInt32 hostCores = CORE0;
+    LOG("RPL host-managed core mask=0x%x (SOF cAVS 2.5 model)", hostCores);
+    U4(ADSPCS, hostCores << 16, hostCores << 16, "RPL ADSPCS: SPA core0");
+    if (!poll(b4, ADSPCS, hostCores << 24, hostCores << 24, 50, "RPL CPA core0")) return false;
+#else
+    const UInt32 hostCores = CORES_ALL;
+    U4(ADSPCS, hostCores << 16, hostCores << 16, "ADSPCS: SPA cores0-3");
+    if (!poll(b4, ADSPCS, hostCores << 24, hostCores << 24, 50, "CPA cores0-3")) return false;
+#endif
     // step 8: ROM_CONTROL
     W4(HIPCIDR, BIT31 | ROM_IPC_CONTROL | ROM_IPC_PURGE_FW | ((UInt32)(STREAM_TAG - 1) << ROM_STREAM_SHIFT), "HIPCIDR: ROM_CONTROL purge+stream");
     // step 9: run core 0 (reset leave, then unstall)
@@ -431,10 +488,15 @@ bool DSPDevice::powerUp(bool dumpMailbox)
     // step 10: wait ROM ack
     if (!poll(b4, HIPCIDA, BIT31, BIT31, 500, "HIPCIDA.DONE")) return false;
     U4(HIPCIDA, BIT31, BIT31, "HIPCIDA: clear DONE");
-    // step 11: power down cores 1-3
+    // step 11: power down non-init host-managed cores. The RPL cAVS 2.5
+    // descriptor manages only core 0, so there is no secondary host operation.
+#ifdef OHMYDSP_RPL_LIVE
+    LOG("RPL secondary core power-down skipped: host-managed mask=0x%x init-core mask=0x%x", hostCores, CORE0);
+#else
     U4(ADSPCS, (CORES_ALL & ~CORE0) << 8 | (CORES_ALL & ~CORE0), (CORES_ALL & ~CORE0) << 8 | (CORES_ALL & ~CORE0), "ADSPCS: cores1-3 stall+reset");
     U4(ADSPCS, (CORES_ALL & ~CORE0) << 16, 0, "ADSPCS: cores1-3 SPA off");
     if (!poll(b4, ADSPCS, (CORES_ALL & ~CORE0) << 24, 0, 50, "CPA cores1-3 off")) return false;
+#endif
     // step 12: ROM init done
     if (!poll(b4, ROM_STATUS, FSR_MASK, FSR_INIT_DONE, 300, "ROM_STATUS INIT_DONE")) {
         // Seen after system sleep (2026-11-06): the ROM leaves INIT_DONE behind and sits in a CSE state (0x11 = CSE_IMR_GRANTED). Read-only diagnosis:
@@ -499,6 +561,32 @@ bool DSPDevice::sendPipeline(UInt32 count)
     if (!fwReady || !ipcBlob || count < 1) { LOG("P3 skipped: firmware not ready or blob missing"); return false; }
     const UInt8 *bp = (const UInt8 *)ipcBlob->getBytesNoCopy();
     UInt32 nsend = count > ipcCount ? ipcCount : count;
+#ifdef OHMYDSP_RPL_LIVE
+    if (!ipc4Blob) {
+        LOG("P3 ABORT: RPL firmware requires an I4PC IPC4 blob");
+        return false;
+    }
+    UInt32 sentIpc4 = 0;
+    for (UInt32 mi = 0; mi < nsend; mi++) {
+        UInt32 pos = ipcOff[mi], len = *(const UInt32 *)(bp + pos);
+        UInt32 extension = *(const UInt32 *)(bp + pos + 4);
+        UInt32 primary = *(const UInt32 *)(bp + pos + 8);
+        UInt32 payloadBytes = len - 12;
+        const UInt32 *payload = (const UInt32 *)(bp + pos + 12);
+        UInt32 replyPrimary = 0, replyExtension = 0;
+        if (dry) {
+            LOG("DRYRUN IPC4 msg %u/%u: len=%u extension=0x%08x primary=0x%08x payload=%u",
+                mi + 1, nsend, len, extension, primary, payloadBytes);
+            sentIpc4++;
+            continue;
+        }
+        char what[48]; snprintf(what, sizeof(what), "IPC4 msg %u/%u", mi + 1, nsend);
+        if (!ipc4Tx(payload, payloadBytes, primary, extension, what, &replyPrimary, &replyExtension)) return false;
+        sentIpc4++;
+    }
+    LOG("PHASE3 IPC4: %u/%u messages accepted", sentIpc4, nsend);
+    return true;
+#endif
     if (downbox != 0xA0000 || upbox != MBOX_UPLINK || downSize < 384) {
         LOG("P3 ABORT: manifest mailbox windows unexpected (down=0x%x/0x%x up=0x%x/0x%x), not sending", downbox, downSize, upbox, upSize);
         return false;
@@ -543,6 +631,411 @@ bool DSPDevice::sendPipeline(UInt32 count)
     return true;
 }
 
+bool DSPDevice::sendIpc4CaptureGraph(UInt32 hostSdi)
+{
+#ifndef OHMYDSP_RPL_LIVE
+    (void)hostSdi;
+    return false;
+#else
+    if (!fwReady || !ipcBlob || !ipc4Blob || hostSdi > 6 || ipcCount != 17) {
+        LOG("IPC4 capture graph refused (fw %d blob %d ipc4 %d SD%u messages %u)",
+            fwReady, ipcBlob != nullptr, ipc4Blob, hostSdi, ipcCount);
+        return false;
+    }
+    const UInt8 *bp = (const UInt8 *)ipcBlob->getBytesNoCopy();
+    // Run 12 appends EQ coefficients after the unchanged run-11 messages.
+    // Refuse old/mismatched assets before sending any graph IPC.
+    const UInt32 *config = (const UInt32 *)(bp + ipcOff[15]);
+    if (config[0] != 12 + 788 || config[1] != 0x30000314u ||
+        config[2] != 0x44000014u || config[3] != 788) {
+        LOG("IPC4 capture graph refused: expected 788-byte TDFB config for module 20 instance 0");
+        return false;
+    }
+    const UInt32 *eq = (const UInt32 *)(bp + ipcOff[16]);
+    if (eq[0] != 12 + 88 || eq[1] != 0x30000058u || eq[2] != 0x4400000au ||
+        eq[3] != 88 || eq[4] != 2 || eq[5] != 1) {
+        LOG("IPC4 capture graph refused: expected 88-byte two-channel EQ config for module 10 instance 0");
+        return false;
+    }
+    UInt32 sent = 0;
+    const UInt32 hostNode = (1u << 8) | hostSdi; // HDA host input gateway, index = stream tag - 1
+    LOG("IPC4 capture graph: patch host-copier node_id=0x%08x for SD%u/tag%u", hostNode, hostSdi, hostSdi + 1);
+    for (UInt32 mi = 0; mi < ipcCount; mi++) {
+        UInt32 pos = ipcOff[mi], len = *(const UInt32 *)(bp + pos);
+        UInt32 extension = *(const UInt32 *)(bp + pos + 4);
+        UInt32 primary = *(const UInt32 *)(bp + pos + 8);
+        UInt32 payloadBytes = len - 12;
+        const UInt32 *payload = (const UInt32 *)(bp + pos + 12);
+        UInt32 patched[IPC4_MAX_PAYLOAD / sizeof(UInt32)];
+        if (payloadBytes > sizeof(patched) || (payloadBytes & 3)) {
+            LOG("IPC4 capture graph message %u has invalid payload size %u", mi + 1, payloadBytes);
+            return false;
+        }
+        if (payloadBytes) memcpy(patched, payload, payloadBytes);
+        // The generated RPL blob uses the IPC4 MOD_INIT_INSTANCE primary
+        // 0x40020004 for the pipeline-11 host copier.  The 0x4102 form is a
+        // different target/opcode encoding and is not emitted by this blob.
+        if (primary == 0x40020004u) {
+            if (payloadBytes < 18 * sizeof(UInt32)) {
+                LOG("IPC4 host-copier payload is too short (%u bytes)", payloadBytes);
+                return false;
+            }
+            if (payload[17] != 0x00000100u) {
+                LOG("IPC4 host-copier payload node_id baseline unexpected: 0x%08x", payload[17]);
+                return false;
+            }
+            patched[17] = hostNode;
+            // Linux IPC4 gives a capture host copier one 1 ms gateway DMA
+            // buffer: max(1 ms, deep-buffer-ms) * base_config.ibs.  The
+            // topology's IBS is 384 bytes.  The offline replay was built
+            // with the DAI copier's 4 ms value (0x600), which is valid for
+            // the DMIC gateway but not for this AIF host copier.
+            if (payloadBytes < 19 * sizeof(UInt32) || payload[18] != 0x00000600u) {
+                LOG("IPC4 host-copier payload DMA size baseline unexpected: 0x%08x", payloadBytes >= 19 * sizeof(UInt32) ? payload[18] : 0);
+                return false;
+            }
+            patched[18] = 0x00000180u;
+            LOG("IPC4 host-copier message patched: payload[17]=0x%08x payload[18]=0x%08x (1 ms)", patched[17], patched[18]);
+        }
+        UInt32 replyPrimary = 0, replyExtension = 0;
+        if (dry) {
+            LOG("DRYRUN IPC4 capture graph msg %u/%u: primary=0x%08x extension=0x%08x payload=%u",
+                mi + 1, ipcCount, primary, extension, payloadBytes);
+        } else {
+            char what[72];
+            if (mi == 15) snprintf(what, sizeof(what), "IPC4 TDFB coefficients 16/17 (788 bytes)");
+            else if (mi == 16) snprintf(what, sizeof(what), "IPC4 EQ coefficients 17/17 (88 bytes)");
+            else snprintf(what, sizeof(what), "IPC4 capture graph %u/%u", mi + 1, ipcCount);
+            if (!ipc4Tx(patched, payloadBytes, primary, extension, what, &replyPrimary, &replyExtension)) return false;
+        }
+        sent++;
+    }
+    LOG("IPC4 capture graph: %u/%u messages accepted (TDFB and EQ coefficients included)", sent, ipcCount);
+    return sent == ipcCount;
+#endif
+}
+
+bool DSPDevice::sendIpc4Probe()
+{
+#ifndef OHMYDSP_RPL_LIVE
+    LOG("IPC4 probe unavailable in the IPC3 build");
+    return false;
+#else
+    // GLB_CREATE_PIPELINE for the two empty pipelines used by the reviewed
+    // capture plan.  No modules are initialized and the DSP is reset during
+    // teardown, so this probe leaves no persistent graph.
+    static const UInt32 payload[] = { 0x01000007, 0, 0, 0x00030003, 0, 8192, 24576 };
+    UInt32 replyPrimary = 0, replyExtension = 0;
+    if (!fwReady) { LOG("IPC4 probe refused: firmware is not ready"); return false; }
+    LOG("IPC4 probe: GLB_CREATE_PIPELINE 12 primary=0x%08x extension=0x%08x payload=%u",
+        0x11000008u, 0x20000000u, (UInt32)sizeof(payload));
+    if (!ipc4Tx(payload, sizeof(payload), 0x11000008u, 0x20000000u,
+                "IPC4 GLB_CREATE_PIPELINE 12 probe", &replyPrimary, &replyExtension)) return false;
+    LOG("IPC4 probe: GLB_CREATE_PIPELINE 11 primary=0x%08x extension=0x%08x payload=%u",
+        0x11010006u, 0x20000000u, (UInt32)sizeof(payload));
+    return ipc4Tx(payload, sizeof(payload), 0x11010006u, 0x20000000u,
+                  "IPC4 GLB_CREATE_PIPELINE 11 probe", &replyPrimary, &replyExtension);
+#endif
+}
+
+bool DSPDevice::sendIpc4PipelineState(UInt32 pipelineId, UInt32 state, const char *what)
+{
+#ifndef OHMYDSP_RPL_LIVE
+    (void)pipelineId; (void)state; (void)what;
+    return false;
+#else
+    // IPC4 GLB_SET_PIPELINE_STATE stores the target state in bits 0..15 and
+    // the pipeline instance in bits 16..23. A single-pipeline request has no
+    // payload and keeps the multi-pipeline extension bit clear.
+    if (pipelineId > 0xff || state > 0xffff) {
+        LOG("%s ABORT: invalid pipeline state id=%u state=%u", what, pipelineId, state);
+        return false;
+    }
+    UInt32 primary = (state & 0xffffu) | ((pipelineId & 0xffu) << 16) | (19u << 24);
+    UInt32 replyPrimary = 0, replyExtension = 0;
+    LOG("IPC4 pipeline state: pipeline=%u state=%u primary=0x%08x", pipelineId, state, primary);
+    return ipc4Tx(nullptr, 0, primary, 0, what, &replyPrimary, &replyExtension);
+#endif
+}
+
+bool DSPDevice::sendIpc4PipelineStateMulti(UInt32 state, UInt32 firstPipelineId, UInt32 secondPipelineId,
+                                           const char *what)
+{
+#ifndef OHMYDSP_RPL_LIVE
+    (void)state; (void)firstPipelineId; (void)secondPipelineId; (void)what;
+    return false;
+#else
+    if (state > 0xffff || firstPipelineId > 0xff || secondPipelineId > 0xff || firstPipelineId == secondPipelineId) {
+        LOG("%s ABORT: invalid multi pipeline state=%u ids=%u,%u", what, state, firstPipelineId, secondPipelineId);
+        return false;
+    }
+    // The payload is a count followed by the runtime pipeline instance IDs.
+    // Callers specify the order for this transition. Keep it in one transaction
+    // instead of exposing a half-running cross-pipeline graph.
+    const UInt32 payload[3] = { 2, firstPipelineId, secondPipelineId };
+    UInt32 primary = (state & 0xffffu) | (19u << 24);
+    UInt32 replyPrimary = 0, replyExtension = 0;
+    LOG("IPC4 multi pipeline state: state=%u ids=%u,%u primary=0x%08x", state, firstPipelineId, secondPipelineId, primary);
+    return ipc4Tx(payload, sizeof(payload), primary, 0x00000001u, what, &replyPrimary, &replyExtension);
+#endif
+}
+
+bool DSPDevice::startIpc4Session()
+{
+    // The owner has published an immutable copy of the preceding session.
+    if (traceArchive) IOFree(traceArchive, TRACE_ARCHIVE_CAPACITY);
+    traceArchive = nullptr; traceArchiveBytes = 0; traceSequence = 0;
+    tracePhase = 0; traceArchiveStopped = false;
+    if (dry || sessionBlocked || sessionTouched || stuck || sdIdx >= 0 || !persistent || !pb.cap) return false;
+    if (!checkIdle()) return false;
+    sessionTouched = true;
+    bool ok = powerUp(false);
+    if (ok) ok = beginIpc4TraceCapture();
+    if (ok) {
+        setIpc4TracePhase(1);
+        sessionGraph = true; // partial graph failures also require unwind
+        ok = sendIpc4CaptureGraph(5);
+    }
+    if (ok) ok = sendIpc4PipelineStateMulti(IPC4_STATE_PAUSED, 0, 1, "IPC4 session PAUSED");
+    if (ok) ok = setupIpc4CaptureStream(5);
+    if (ok) {
+        memset(pb.cap->getBytesNoCopy(), 0, capBytes);
+        setIpc4TracePhase(2);
+        sessionTrace = setIpc4Trace(true);
+        ok = sessionTrace;
+    }
+    if (ok) {
+        setIpc4TracePhase(3);
+        ok = sendIpc4PipelineStateMulti(IPC4_STATE_RUNNING, 1, 0, "IPC4 session RUNNING");
+    }
+    if (ok) ok = startIpc4CaptureDma();
+    if (!ok) stopIpc4Session();
+    LOG("IPC4 session start: %s", ok ? "PASS" : "FAILED");
+    return ok;
+}
+
+bool DSPDevice::stopIpc4Session()
+{
+    if (!sessionTouched) return !sessionBlocked;
+    bool clean = true;
+    setIpc4TracePhase(4);
+    if (sessionGraph) clean = sendIpc4PipelineStateMulti(IPC4_STATE_PAUSED, 0, 1, "IPC4 session PAUSE cleanup");
+    StopInfo stop;
+    if (!stopDma(&stop)) clean = false;
+    if (sessionGraph && !sendIpc4PipelineStateMulti(IPC4_STATE_RESET, 1, 0, "IPC4 session RESET cleanup")) clean = false;
+    setIpc4TracePhase(5);
+    if (sessionTrace && !setIpc4Trace(false)) clean = false;
+    setIpc4TracePhase(6);
+    bool touched = streamTouchedHw;
+    if (!freeStream()) clean = false;
+    teardown(false);
+    if (touched && !captureDescriptorIdle()) clean = false;
+    if (stuck || r32(b4, ADSPCS) != 0x00000f0f) clean = false;
+    sessionTouched = sessionGraph = sessionTrace = false;
+    if (!clean) sessionBlocked = true; // no retries after an uncertain unwind
+    LOG("IPC4 session stop: %s blocked=%d", clean ? "PASS" : "FAILED", sessionBlocked);
+    return clean;
+}
+
+void DSPDevice::serviceIpc4Trace()
+{
+    if (!sessionTouched || !fwReady) return;
+    drainIpc4Trace();
+    for (UInt32 n = 0; n < 4; n++) {
+        UInt32 pending = r32(b4, HIPCTDR);
+        if (!(pending & BIT31) || !ackIpc4Notification(pending, "IPC4 session async")) break;
+    }
+}
+
+bool DSPDevice::beginIpc4TraceCapture()
+{
+    if (dry || !fwReady || stuck || traceArchive || len4 < IPC4_DEBUG + 0x10000) return false;
+    traceArchive = (UInt8 *)IOMalloc(TRACE_ARCHIVE_CAPACITY);
+    if (!traceArchive) return false;
+    // MTR1 archive v1: header [magic, version, flags, full-ring observations].
+    // Flags: 1=observed full ring, 2=invalid metadata, 4=archive capacity hit.
+    UInt32 header[4] = { 0x3152544d, 1, 0, 0 };
+    memcpy(traceArchive, header, sizeof(header));
+    traceArchiveBytes = sizeof(header);
+    LOG("MTRACE stream begin: capacity=%u; copy before host-read acknowledgement", TRACE_ARCHIVE_CAPACITY);
+    drainIpc4Trace();
+    return true;
+}
+
+void DSPDevice::setIpc4TracePhase(UInt32 phase)
+{
+    // Drain the preceding phase first, so boundary labels do not relabel it.
+    drainIpc4Trace();
+    tracePhase = phase;
+}
+
+void DSPDevice::drainIpc4Trace()
+{
+    if (!traceArchive || traceArchiveStopped || dry || !fwReady || len4 < IPC4_DEBUG + 0x10000) return;
+    UInt32 *archiveHeader = (UInt32 *)traceArchive;
+    UInt32 slots = 0;
+    for (UInt32 slot = 0; slot < 15 && slots < 4; slot++) {
+        UInt32 type = r32(b4, IPC4_DEBUG + slot * 12 + 4);
+        if ((type & 0xffffff00u) != 0x474f4c00u) continue;
+        slots++;
+        UInt32 base = IPC4_DEBUG + (slot + 1) * 0x1000;
+        UInt32 read = r32(b4, base), write = r32(b4, base + 4);
+        if (read >= 4088 || write >= 4088) {
+            archiveHeader[2] |= 2;
+            LOG("MTRACE stream invalid slot=%u read=%u write=%u; no acknowledgement", slot, read, write);
+            traceArchiveStopped = true;
+            return;
+        }
+        UInt32 count = (write + 4088 - read) % 4088;
+        if (!count) continue;
+        if (count == 4087) { archiveHeader[2] |= 1; archiveHeader[3]++; }
+        UInt32 padded = (count + 3) & ~3u;
+        UInt32 recordBytes = 32 + padded;
+        if (recordBytes > TRACE_ARCHIVE_CAPACITY - traceArchiveBytes) {
+            archiveHeader[2] |= 4;
+            traceArchiveStopped = true;
+            LOG("MTRACE stream archive full at %u bytes; unread data not acknowledged", traceArchiveBytes);
+            return;
+        }
+        UInt32 header[8] = { recordBytes, traceSequence, tracePhase, slot, type, read, write, count };
+        UInt8 *record = traceArchive + traceArchiveBytes;
+        memcpy(record, header, sizeof(header));
+        UInt32 lastWord = ~0u, value = 0;
+        for (UInt32 i = 0; i < count; i++) {
+            UInt32 pos = (read + i) % 4088;
+            UInt32 word = pos & ~3u;
+            if (word != lastWord) { value = r32(b4, base + 8 + word); lastWord = word; }
+            record[32 + i] = (UInt8)(value >> ((pos & 3) * 8));
+        }
+        memset(record + 32 + count, 0, padded - count);
+        // Producer never overwrites unread bytes (Zephyr mtrace_out). It may
+        // append while copying; acknowledge only the captured write pointer.
+        // Metadata/read-pointer changes imply reset or another consumer.
+        if (r32(b4, base) != read || r32(b4, IPC4_DEBUG + slot * 12 + 4) != type) {
+            archiveHeader[2] |= 2;
+            traceArchiveStopped = true;
+            LOG("MTRACE stream slot changed during copy; no acknowledgement");
+            return;
+        }
+        traceArchiveBytes += recordBytes;
+        traceSequence++;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        W4(base, write, "MTRACE host read: copied bytes retained in archive");
+    }
+}
+
+bool DSPDevice::setIpc4Trace(bool enable)
+{
+    if (dry || !fwReady || stuck) return false;
+    // Linux ipc4-mtrace.c / SOF 2.12 ipc4_log_state_info: 19 DWORDs.
+    // module 0, instance 0, LARGE_CONFIG_SET, parameter 6, first+last.
+    UInt32 payload[19] = { 0x100, 0x1000, enable ? 1u : 0u, 0x1ef };
+    return ipc4Tx(payload, sizeof(payload), 0x44000000, 0x3060004c,
+                  enable ? "IPC4 mtrace enable" : "IPC4 mtrace disable", nullptr, nullptr);
+}
+
+bool DSPDevice::ackIpc4Notification(UInt32 primary, const char *what)
+{
+    // Global request type 27, distinct from a module/global command reply.
+    if ((primary & 0x7f000000u) != 0x1b000000u) return false;
+    drainIpc4Trace();
+    LOG("%s notification: primary=%08x extension=%08x type=%u core=%u uplink=%08x %08x %08x %08x",
+        what, primary & ~BIT31, r32(b4, HIPCTDD), (primary >> 16) & 0xff,
+        (primary >> 12) & 0xf, r32(b4, upbox), r32(b4, upbox+4), r32(b4, upbox+8), r32(b4, upbox+12));
+    W4(HIPCTDR, BIT31, "IPC4 notification: ack BUSY (w1c)");
+    U4(HIPCTDA, BIT31, BIT31, "IPC4 notification: DONE");
+    return true;
+}
+
+bool DSPDevice::ipc4Tx(const UInt32 *payload, UInt32 payloadBytes, UInt32 primary, UInt32 extension,
+                       const char *what, UInt32 *replyPrimary, UInt32 *replyExtension)
+{
+#ifndef OHMYDSP_RPL_LIVE
+    (void)payload; (void)payloadBytes; (void)primary; (void)extension; (void)what;
+    (void)replyPrimary; (void)replyExtension;
+    return false;
+#else
+    if ((payloadBytes && !payload) || (payloadBytes & 3) || payloadBytes > IPC4_MAX_PAYLOAD ||
+        !downbox || !upbox || downSize < IPC4_MAX_PAYLOAD || upSize < IPC4_MAX_PAYLOAD) {
+        LOG("%s ABORT: invalid IPC4 mailbox payload/windows (payload=%u down=0x%x/0x%x up=0x%x/0x%x)",
+            what, payloadBytes, downbox, downSize, upbox, upSize);
+        return false;
+    }
+    UInt32 notifications = 0;
+    drainIpc4Trace();
+    // A notification can already be pending between transactions. Drain only
+    // notifications; an unsolicited reply remains an error. Bound all phases.
+    for (UInt32 n = 0; n < 16; n++) {
+        UInt32 pending = r32(b4, HIPCTDR);
+        if (!(pending & BIT31) || !ackIpc4Notification(pending, what)) break;
+        notifications++;
+        IOSleep(1);
+    }
+    UInt32 idr = r32(b4, HIPCIDR), tdr = r32(b4, HIPCTDR), ida = r32(b4, HIPCIDA);
+    LOG("%s pre: HIPCIDR=0x%08x HIPCIDD=0x%08x HIPCIDA=0x%08x HIPCTDR=0x%08x HIPCTDD=0x%08x",
+        what, idr, r32(b4, HIPCIDD), ida, tdr, r32(b4, HIPCTDD));
+    if (tdr & BIT31 || idr & BIT31) {
+        LOG("%s ABORT: IPC busy before send", what);
+        return false;
+    }
+    if (ida & BIT31) U4(HIPCIDA, BIT31, BIT31, "IPC4 HIPCIDA: clear stale DONE");
+    for (UInt32 i = 0; i < payloadBytes / 4; i++) W4(downbox + 4 * i, payload[i], "IPC4 outbox payload");
+    W4(HIPCIDD, extension, "IPC4 HIPCIDD: extension");
+    W4(HIPCIDR, primary | BIT31, "IPC4 HIPCIDR: primary+BUSY");
+    for (UInt32 ms = 0; ms < 500 && !(r32(b4, HIPCIDA) & BIT31); ms++) {
+        drainIpc4Trace();
+        UInt32 pending = r32(b4, HIPCTDR);
+        if ((pending & BIT31) && notifications < 32 && ackIpc4Notification(pending, what)) notifications++;
+        IOSleep(1);
+    }
+    if (!(r32(b4, HIPCIDA) & BIT31)) {
+        LOG("%s accept timeout: HIPCIDR=0x%08x HIPCIDA=0x%08x HIPCTDR=0x%08x HIPCCTL=0x%08x",
+            what, r32(b4, HIPCIDR), r32(b4, HIPCIDA), r32(b4, HIPCTDR), r32(b4, 0xE8));
+        return false;
+    }
+    LOG("%s accepted: HIPCIDR=0x%08x HIPCIDA=0x%08x", what, r32(b4, HIPCIDR), r32(b4, HIPCIDA));
+    U4(HIPCIDA, BIT31, BIT31, "IPC4 HIPCIDA: ack DONE");
+    bool haveReply = false;
+    for (UInt32 ms = 0; ms < 500; ms++) {
+        drainIpc4Trace();
+        UInt32 pending = r32(b4, HIPCTDR);
+        if (pending & BIT31) {
+            if ((pending & 0x7f000000u) == 0x1b000000u) {
+                if (notifications >= 32) { LOG("%s ABORT: notification limit", what); return false; }
+                ackIpc4Notification(pending, what);
+                notifications++;
+            } else { haveReply = true; break; }
+        }
+        IOSleep(1);
+    }
+    if (!haveReply) {
+        LOG("%s reply timeout: HIPCIDR=0x%08x HIPCIDA=0x%08x HIPCTDR=0x%08x HIPCTDD=0x%08x",
+            what, r32(b4, HIPCIDR), r32(b4, HIPCIDA), r32(b4, HIPCTDR), r32(b4, HIPCTDD));
+        for (UInt32 i = 0; i < 4; i++) LOG("%s uplink[%u]=0x%08x", what, i, r32(b4, upbox + 4 * i));
+        return false;
+    }
+    UInt32 rp = r32(b4, HIPCTDR) & ~BIT31;
+    UInt32 re = r32(b4, HIPCTDD) & ~BIT31;
+    if (replyPrimary) *replyPrimary = rp;
+    if (replyExtension) *replyExtension = re;
+    LOG("%s reply: primary=0x%08x extension=0x%08x status=%u uplink[0..3]=%08x %08x %08x %08x",
+        what, rp, re, rp & IPC4_REPLY_STATUS, r32(b4, upbox), r32(b4, upbox + 4),
+        r32(b4, upbox + 8), r32(b4, upbox + 12));
+    W4(HIPCTDR, BIT31, "IPC4 HIPCTDR: ack BUSY (w1c)");
+    U4(HIPCTDA, BIT31, BIT31, "IPC4 HIPCTDA: DONE");
+    drainIpc4Trace();
+    if (!(rp & IPC4_REPLY_DIR) || (rp & 0x5f000000u) != (primary & 0x5f000000u)) {
+        LOG("%s FAILED: mismatched reply direction/target/type (primary=0x%08x request=0x%08x)", what, rp, primary);
+        return false;
+    }
+    if (rp & IPC4_REPLY_STATUS) {
+        LOG("%s FAILED: firmware status=%u", what, rp & IPC4_REPLY_STATUS);
+        return false;
+    }
+    return true;
+#endif
+}
+
 // one IPC round trip for stream messages (same transport as the Phase 3 replay)
 bool DSPDevice::ipcTx(const UInt32 *msg, UInt32 len, const char *what, UInt32 minReply, UInt32 *reply)
 {
@@ -563,6 +1056,158 @@ bool DSPDevice::ipcTx(const UInt32 *msg, UInt32 len, const char *what, UInt32 mi
         W4(HIPCTDR, BIT31, "P4 HIPCTDR: ack BUSY (w1c)"); U4(HIPCTDA, BIT31, BIT31, "P4 HIPCTDA: DONE"); }
     if (reply[0] < minReply || (SInt32)reply[2] != 0) { LOG("P4 %s FAILED (reply size %u error %d)", what, reply[0], (SInt32)reply[2]); return false; }
     return true;
+}
+
+bool DSPDevice::setupIpc4CaptureStream(UInt32 sdi)
+{
+    if (dry || !fwReady || stuck || sdIdx >= 0 || sdi > 6) {
+        LOG("IPC4 capture stream refused (dry %d fw %d stuck %d active %d SD%u)",
+            dry, fwReady, stuck, sdIdx >= 0, sdi);
+        return false;
+    }
+    sd = SD_BASE + SD_STRIDE * sdi;
+    sdBit = 1u << sdi;
+    sdTag = sdi + 1;
+    sdIdx = (int)sdi;
+    streamMode = 6;
+    streamFailed = false;
+    paramsSent = false;
+    dmaOn = false;
+    triggered = false;
+    streamTouchedHw = false;
+    LOG("IPC4 capture stream setup: SD%u tag %u, no PCM_PARAMS, no RUN", sdi, sdTag);
+
+    UInt32 ctl = r32(b0, sd);
+    if ((ctl & SD_CTL_RUN) || ((ctl >> SD_TAG_SHIFT) & 0xF) || r32(b0, sd + SD_CBL) ||
+        (r32(b0, ppBase + 4) & sdBit) || (r32(b0, spibBase + 4) & sdBit)) {
+        LOG("IPC4 capture stream abort: SD%u not idle/unused (CTL=0x%08x)", sdi, ctl);
+        sdIdx = -1;
+        return false;
+    }
+    if (!pb.cap && !allocBuffers(pb)) {
+        streamFailed = true;
+        return false;
+    }
+    memset(pb.cap->getBytesNoCopy(), 0xA5, capBytes);
+
+    streamTouchedHw = true;
+    U0(ppBase + 4, sdBit, sdBit, "IPC4 PPCTL: decouple capture SD");
+    U0(sd, SD_CTL_RUN | SD_CTL_INTS, 0, "IPC4 SD CTL: clear RUN/int enables");
+    if (!poll(b0, sd, SD_CTL_RUN, 0, 5, "IPC4 SD RUN clear")) { streamFailed = true; return false; }
+    W0_8(sd + SD_STS, SD_CTL_INTS, "IPC4 SD STS clear (w1c)");
+    U0(sd, SD_CTL_SRST, SD_CTL_SRST, "IPC4 SD CTL: enter reset");
+    if (!poll(b0, sd, SD_CTL_SRST, SD_CTL_SRST, 5, "IPC4 SD in reset")) { streamFailed = true; return false; }
+    U0(sd, SD_CTL_SRST, 0, "IPC4 SD CTL: leave reset");
+    if (!poll(b0, sd, SD_CTL_SRST, 0, 5, "IPC4 SD out of reset")) { streamFailed = true; return false; }
+    W0(sd + SD_BDLPL, 0, "IPC4 BDLPL clear");
+    W0(sd + SD_BDLPU, 0, "IPC4 BDLPU clear");
+    U0(sd, 0xF << SD_TAG_SHIFT, sdTag << SD_TAG_SHIFT, "IPC4 SD CTL: stream tag");
+    W0(sd + SD_CBL, capBytes, "IPC4 SD CBL");
+    W0_16(sd + SD_FMT, P4_FMT, "IPC4 SD FORMAT (48k, 32 bit, 2 ch)");
+    W0_16(sd + SD_LVI, (UInt16)(pb.nent - 1), "IPC4 SD LVI");
+    W0(sd + SD_BDLPL, (UInt32)pb.bdlIova, "IPC4 BDLPL");
+    W0(sd + SD_BDLPU, (UInt32)(pb.bdlIova >> 32), "IPC4 BDLPU");
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    LOG("IPC4 capture stream ready: buffer=%u BDL entries=%u page-table IOVA=0x%llx",
+        capBytes, pb.nent, pb.ptIova);
+    return true;
+}
+
+bool DSPDevice::startIpc4CaptureDma()
+{
+    if (dry || sdIdx < 0 || streamMode != 6 || dmaOn) {
+        LOG("IPC4 capture DMA start refused (dry %d active %d mode %d dmaOn %d)",
+            dry, sdIdx >= 0, streamMode, dmaOn);
+        return false;
+    }
+    UInt32 lp0 = r32(b0, sd + 4);
+    UInt32 sts0 = r32(b0, sd) >> 24;
+    LOG("IPC4 capture before SD RUN: LPIB=0x%08x STS=0x%02x CTL=0x%08x", lp0, sts0, r32(b0, sd));
+    if (sts0 & 0x18) { streamFailed = true; return false; }
+    ipc4LpibStart = lp0;
+    clock_get_uptime(&ipc4DmaStartTime);
+    dmaOn = true;
+    U0(sd, SD_CTL_RUN, SD_CTL_RUN, "IPC4 SD CTL: RUN (DMA start)");
+    if (!poll(b0, sd, SD_CTL_RUN, SD_CTL_RUN, 5, "IPC4 SD RUN set")) { streamFailed = true; return false; }
+    LOG("IPC4 capture SD RUN set: LPIB=0x%08x STS=0x%02x CTL=0x%08x",
+        r32(b0, sd + 4), r32(b0, sd) >> 24, r32(b0, sd));
+    return true;
+}
+
+bool DSPDevice::observeIpc4CaptureStream(UInt32 durationMs)
+{
+    if (dry || sdIdx < 0 || streamMode != 6 || !dmaOn || durationMs == 0 || durationMs > 2000) {
+        LOG("IPC4 capture observe refused (dry %d active %d mode %d dmaOn %d duration %u)",
+            dry, sdIdx >= 0, streamMode, dmaOn, durationMs);
+        return false;
+    }
+    UInt32 lp0 = ipc4LpibStart;
+
+    bool wrapped = false;
+    UInt32 lpLast = lp0, lpMax = lp0, error = 0;
+    UInt32 marks[] = {5, 10, 25, 50, 100, 250, 500, 1000};
+    UInt32 nextMark = 0;
+    for (UInt32 elapsed = 0; elapsed < durationMs; elapsed += 5) {
+        IOSleep(5);
+        drainIpc4Trace();
+        UInt32 lp = 0, sts = 0;
+        sample(&lp, &sts);
+        if (lp < lpLast || lp >= capBytes) wrapped = true;
+        if (lp > lpMax) lpMax = lp;
+        if (sts & 0x18) error |= sts;
+        while (nextMark < sizeof(marks) / sizeof(marks[0]) && elapsed + 5 >= marks[nextMark]) {
+            LOG("IPC4 capture t=%u ms: LPIB=0x%08x STS=0x%02x", marks[nextMark], lp, sts);
+            nextMark++;
+        }
+        lpLast = lp;
+    }
+    UInt64 now, elapsedNs;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now - ipc4DmaStartTime, &elapsedNs);
+    const bool valid = !wrapped && lpLast > lp0 && !error &&
+                       elapsedNs < (UInt64)capBytes * 1000000000ULL / 384000;
+    LOG("IPC4 capture: frames=%u start=%u end=%u max=%u elapsed-ms=%llu SD-errors=0x%x %s",
+        valid ? (lpLast - lp0) / 8 : 0, lp0, lpLast, lpMax, elapsedNs / 1000000,
+        error, valid ? "PASS" : "FAILED");
+    if (!valid) streamFailed = true;
+    return valid;
+}
+
+bool DSPDevice::captureDescriptorIdle()
+{
+    UInt32 ctl = r32(b0, sd) & (SD_CTL_RUN | SD_CTL_SRST | (0xfu << SD_TAG_SHIFT));
+    UInt32 cbl = r32(b0, sd + SD_CBL);
+    UInt32 lo = r32(b0, sd + SD_BDLPL), hi = r32(b0, sd + SD_BDLPU);
+    UInt32 decoupled = r32(b0, ppBase + 4) & sdBit;
+    if (!(ctl || cbl || lo || hi || decoupled)) return true;
+    LOG("SD5 cleanup failed: CTL=%x CBL=%x BDL=%x:%x PPCTL=%x", ctl, cbl, hi, lo, decoupled);
+    return false;
+}
+
+bool DSPDevice::finishIpc4CaptureProbe(bool graph, bool trace)
+{
+    setIpc4TracePhase(4);
+    bool paused = !graph || sendIpc4PipelineStateMulti(IPC4_STATE_PAUSED, 0, 1, "IPC4 probe PAUSE cleanup");
+    StopInfo stop;
+    bool stopped = stopDma(&stop) && !(stop.stsEnd & 0x18);
+    bool reset = !graph || sendIpc4PipelineStateMulti(IPC4_STATE_RESET, 1, 0, "IPC4 probe RESET cleanup");
+    setIpc4TracePhase(5);
+    bool disabled = !trace || setIpc4Trace(false);
+    setIpc4TracePhase(6);
+    bool touched = streamTouchedHw;
+    bool freed = freeStream();
+    teardown(false);
+    bool idle = checkIdle();
+    if (touched && !captureDescriptorIdle()) idle = false;
+    LOG("IPC4 probe cleanup: paused=%d stopped=%d reset=%d trace-disabled=%d freed=%d idle=%d",
+        paused, stopped, reset, disabled, freed, idle);
+    return paused && stopped && reset && disabled && freed && idle;
+}
+
+bool DSPDevice::runIpc4CaptureStream(UInt32 durationMs)
+{
+    if (!startIpc4CaptureDma()) return false;
+    return observeIpc4CaptureStream(durationMs);
 }
 
 // ---- Phase 4 capture stream: program stream SDn, send PCM_PARAMS, optionally DMA RUN and TRIG_START ----

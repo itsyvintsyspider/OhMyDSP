@@ -3,6 +3,7 @@
 #include "Capture.hpp"
 #include "DSPDevice.hpp"
 #include "Config.hpp"
+#include "OhMyDSP.hpp"
 #include <os/log.h>
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
@@ -18,10 +19,11 @@ static inline uint32_t msSince(uint64_t from) { uint64_t n; clock_get_uptime(&n)
 OSDefineMetaClassAndStructors(OhMyDSPCapture, OSObject)
 #undef super
 
-bool OhMyDSPCapture::setup(DSPDevice *d)
+bool OhMyDSPCapture::setup(DSPDevice *d, OhMyDSP *service)
 {
     if (!OSObject::init()) return false;
     dsp = d;
+    owner = service;
     ringBytes = dsp->captureBytes(); ringFrames = ringBytes / FRAME_BYTES;
     tickMs = (UInt32)gCfg.tickMs;
     wl = IOWorkLoop::workLoop();
@@ -33,6 +35,7 @@ bool OhMyDSPCapture::setup(DSPDevice *d)
     st = (OhMyDSPStatus *)statusBuf->getBytesNoCopy();
     memset(st, 0, 4096);
     st->magic = OHMYDSP_STATUS_MAGIC; st->version = OHMYDSP_STATUS_VERSION;
+    st->capabilities = OHMYDSP_CAP_COHERENT_POSITION;
     st->ringBytes = ringBytes; st->frameBytes = FRAME_BYTES; st->rate = RATE; st->channels = 2;
     OLOG("capture ready: %u Hz, 2 ch S32, %u frames ring (%u bytes)", (unsigned)RATE, (unsigned)ringFrames, (unsigned)ringBytes);
     return true;
@@ -57,6 +60,10 @@ IOReturn OhMyDSPCapture::gateStop(OSObject *o, void *, void *, void *, void *) {
 IOReturn OhMyDSPCapture::gateTune(OSObject *o, void *a, void *b, void *, void *)
 {
     OhMyDSPCapture *c = static_cast<OhMyDSPCapture *>(o);
+#ifdef OHMYDSP_RPL_IPC4_SESSION
+    (void)c; (void)a; (void)b;
+    return kIOReturnUnsupported;
+#endif
     uint32_t key = (uint32_t)(uintptr_t)a, v = (uint32_t)(uintptr_t)b;
     if (key == OHMYDSP_TUNE_INJECT && c->active && !c->silent && (v == 1 || v == 2)) {
         if (v == 2) c->failStarts = 3;
@@ -70,34 +77,50 @@ IOReturn OhMyDSPCapture::doStart()
     if (running) return kIOReturnSuccess;
     OLOG("engine start (live)");
     silent = false; stallTicks = 0; lastLpib = 0; laps = 0;
+#ifdef OHMYDSP_RPL_IPC4_SESSION
+    if (owner) owner->captureLog("starting", true);
+#endif
     if (!bringUp(false)) return kIOReturnError;
     return kIOReturnSuccess;
 }
 
 IOReturn OhMyDSPCapture::doStop()
 {
-    if (!running && !active) return kIOReturnSuccess;
+    if (!running && !active) return lastStopClean ? kIOReturnSuccess : kIOReturnError;
     OLOG("engine stop");
     running = false;
     if (timer) timer->cancelTimeout();
-    if (active) bringDown();
-    publish(OHMYDSP_STATE_STOPPED, 0);
-    return kIOReturnSuccess;
+    if (active) lastStopClean = bringDown();
+    publish(lastStopClean ? OHMYDSP_STATE_STOPPED : OHMYDSP_STATE_ERROR, 0);
+    return lastStopClean ? kIOReturnSuccess : kIOReturnError;
 }
 
-void OhMyDSPCapture::publish(uint32_t state, uint32_t lpib) { if (st) { st->lpib = lpib; st->state = state; } }
-void OhMyDSPCapture::publishLap(uint64_t l, uint64_t hostTime)
+void OhMyDSPCapture::publish(uint32_t state, uint32_t lpib, bool newEpoch)
 {
     if (!st) return;
     st->seq++; __sync_synchronize();
-    st->laps = l; st->lapHostTime = hostTime;
+    if (newEpoch) st->epoch++;
+    st->laps = laps; st->lapHostTime = lapTime; st->lpib = lpib; st->state = state;
     __sync_synchronize(); st->seq++;
+}
+void OhMyDSPCapture::publishLap(uint64_t l, uint64_t hostTime)
+{
+    laps = l; lapTime = hostTime; // publish with LPIB, never a mixed wrap snapshot
 }
 
 // DSP power-up + firmware + pipeline + capture stream (all steps logged and bounded by DSPDevice). Used by start and by fault recovery.
 // After a system wake AppleHDAController may still be bringing the controller back, so the idle check is retried a few times (bounded, 0.8 s).
 bool OhMyDSPCapture::bringUp(bool restart)
 {
+#ifdef OHMYDSP_RPL_IPC4_SESSION
+    if (!dsp->startIpc4Session()) {
+        lastStopClean = dsp->stopIpc4Session();
+        publish(OHMYDSP_STATE_ERROR, 0);
+        if (owner) owner->captureLog("start-failed");
+        return false;
+    }
+    lastStopClean = true;
+#else
     if (failStarts > 0) { failStarts--; OLOG("INJECT: live start refused (%d more to refuse)", (int)failStarts); return false; }
     uint64_t a, b, c, d;
     clock_get_uptime(&a);
@@ -115,22 +138,32 @@ bool OhMyDSPCapture::bringUp(bool restart)
     OLOG("engine start latency: power-up+firmware %u ms, pipeline %u ms, stream %u ms, total %u ms -> %s",
          (unsigned)(absToNs(b - a) / 1000000ULL), (unsigned)(absToNs(c - b) / 1000000ULL), (unsigned)(absToNs(d - c) / 1000000ULL), (unsigned)(absToNs(d - a) / 1000000ULL), ok ? "OK" : "FAILED");
     if (!ok) { dsp->freeStream(); dsp->teardown(false); return false; }
+#endif
     active = true;
     UInt32 lp = 0, sts = 0; dsp->sample(&lp, &sts);
     uint64_t now; clock_get_uptime(&now);
+    lastPoll = now;
     t0 = now - nsToAbs((uint64_t)((lp % ringBytes) / FRAME_BYTES) * 1000000000ULL / RATE);   // when frame 0 of this lap was written
     if (restart) laps++;                            // keep the sample timeline monotonic across a recovery
     publishLap(laps, t0);
-    if (st) st->epoch++;
     lastLpib = lp % ringBytes; stallTicks = 0;
-    publish(OHMYDSP_STATE_RUNNING, lastLpib);
+    publish(OHMYDSP_STATE_RUNNING, lastLpib, true);
     running = true;
+#ifdef OHMYDSP_RPL_IPC4_SESSION
+    if (owner) owner->captureLog("running");
+#endif
     timer->setTimeoutMS(tickMs);
     return true;
 }
 
-void OhMyDSPCapture::bringDown()
+bool OhMyDSPCapture::bringDown()
 {
+#ifdef OHMYDSP_RPL_IPC4_SESSION
+    bool clean = dsp->stopIpc4Session();
+    active = false;
+    if (owner) owner->captureLog(clean ? "stopped" : "stop-failed");
+    return clean;
+#else
     uint64_t a; clock_get_uptime(&a);
     DSPDevice::StopInfo si;
     bool ok = dsp->stopDma(&si);
@@ -138,12 +171,24 @@ void OhMyDSPCapture::bringDown()
     dsp->teardown(false);
     active = false;
     OLOG("engine stop: DMA stop %s, stream free %s, DSP down, %u ms", ok ? "OK" : "FAILED", clean ? "clean" : "NOT CLEAN", (unsigned)msSince(a));
+    return ok && clean;
+#endif
 }
 
 // Health check reaction: tear the stream down, then restart it (at most MAX_RECOVERIES restarts per minute). If that does not work the session
 // keeps its clock running and publishes silence, so the client neither hangs nor sees an overload; the next start from the client tries again.
 void OhMyDSPCapture::recover(const char *why)
 {
+#ifdef OHMYDSP_RPL_IPC4_SESSION
+    faults++; if (st) st->faults = faults;
+    OLOG("IPC4 session FAULT: %s; stopping without automatic restart", why);
+    running = false;
+    timer->cancelTimeout();
+    lastStopClean = bringDown();
+    publish(OHMYDSP_STATE_ERROR, lastLpib);
+    if (owner) owner->captureLog(why);
+    return;
+#else
     uint64_t now; clock_get_uptime(&now);
     if (absToNs(now - lastFault) > 60ULL * 1000000000ULL) faultCount = 0;
     lastFault = now; faults++; if (st) st->faults = faults;
@@ -159,8 +204,9 @@ void OhMyDSPCapture::recover(const char *why)
     silent = true; laps = 0;
     clock_get_uptime(&t0);
     publishLap(0, t0);
-    publish(OHMYDSP_STATE_SILENT, 0);
+    publish(OHMYDSP_STATE_SILENT, 0, true);
     OLOG("FAULT: giving up, the session publishes silence until the client restarts the input");
+#endif
 }
 
 void OhMyDSPCapture::tickAction(OSObject *owner, IOTimerEventSource *)
@@ -187,8 +233,13 @@ void OhMyDSPCapture::tick()
 // at (now - time since the wrap), computed from the new LPIB, and no interrupt is needed. INTCTL / SD interrupt enables stay untouched.
 void OhMyDSPCapture::tickLive()
 {
+    uint64_t pollTime; clock_get_uptime(&pollTime);
+    if (lastPoll && absToNs(pollTime - lastPoll) >= (uint64_t)ringFrames * 1000000000ULL / RATE) {
+        recover("polling gap could conceal a ring wrap"); return;
+    }
+    lastPoll = pollTime;
     UInt32 lp = 0, sts = 0; dsp->sample(&lp, &sts);
-    lp %= ringBytes;
+    if (lp >= ringBytes) { recover("LPIB outside capture ring"); return; }
     if (injectStall) { injectStall = false; DSPDevice::StopInfo si; dsp->stopDma(&si); OLOG("INJECT: DMA stopped behind the engine's back"); return; }
     if (sts & 0x18) { char w[64]; snprintf(w, sizeof w, "SD error flags STS=0x%02x at LPIB %u", (unsigned)sts, (unsigned)lp); recover(w); return; }
     if (lp == lastLpib) {
@@ -201,7 +252,10 @@ void OhMyDSPCapture::tickLive()
         if (gCfg.debug && (laps <= 3 || laps % 100 == 0)) OLOG("wrap %llu published (lpib %u, ticks %llu)", (unsigned long long)laps, (unsigned)lp, (unsigned long long)ticks);
     }
     lastLpib = lp;
-    if (st) st->lpib = lp;
+    publish(OHMYDSP_STATE_RUNNING, lp);
+#ifdef OHMYDSP_RPL_IPC4_SESSION
+    dsp->serviceIpc4Trace();
+#endif
 }
 
 // silent: no DMA any more; the position follows a software clock so clients keep running at the right speed (the ring is all zeros).
@@ -212,5 +266,5 @@ void OhMyDSPCapture::tickSilent()
     uint64_t l = total / ringFrames;
     if (l != laps) { laps = l; publishLap(laps, t0 + nsToAbs(l * ringFrames * 1000000000ULL / RATE)); }
     lastLpib = (UInt32)(total % ringFrames) * FRAME_BYTES;
-    if (st) st->lpib = lastLpib;
+    publish(OHMYDSP_STATE_SILENT, lastLpib);
 }

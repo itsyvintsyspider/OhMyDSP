@@ -10,11 +10,12 @@
 #include "../include/OhMyDSPShared.h"
 
 class DSPDevice;
+class OhMyDSP;
 
 class OhMyDSPCapture : public OSObject {
     OSDeclareDefaultStructors(OhMyDSPCapture)
 public:
-    bool setup(DSPDevice *d);                   // work loop, timer, gate, status page (software only)
+    bool setup(DSPDevice *d, OhMyDSP *owner = nullptr); // software-only preparation
     void shutdown();                            // stops a running stream, releases everything (idempotent)
     IOReturn start();                           // may be called from any thread; serialised on the capture work loop
     IOReturn stop();
@@ -28,10 +29,13 @@ private:
     static void tickAction(OSObject *owner, IOTimerEventSource *sender);
     IOReturn doStart(); IOReturn doStop(); void tick();
     void tickLive(); void tickSilent();
-    bool bringUp(bool restart); void bringDown(); void recover(const char *why);
-    void publish(uint32_t state, uint32_t lpib);            // status page: state + position
+    bool bringUp(bool restart); bool bringDown(); void recover(const char *why);
+    void publish(uint32_t state, uint32_t lpib, bool newEpoch = false); // status page: state + position
     void publishLap(uint64_t laps, uint64_t hostTime);      // status page: seqlock-protected lap counter + time
     DSPDevice *dsp = nullptr;
+    OhMyDSP *owner = nullptr; // provider outlives its capture object
+    UInt64 lapTime = 0, lastPoll = 0;
+    bool lastStopClean = true;
     IOWorkLoop *wl = nullptr; IOCommandGate *gate = nullptr; IOTimerEventSource *timer = nullptr;
     IOBufferMemoryDescriptor *statusBuf = nullptr; OhMyDSPStatus *st = nullptr;
     UInt32 ringBytes = 0, ringFrames = 0;

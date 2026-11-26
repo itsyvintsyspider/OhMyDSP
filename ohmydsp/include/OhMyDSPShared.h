@@ -17,10 +17,12 @@
 #define OHMYDSP_STATUS_MAGIC    0x4F4D4453u     /* 'OMDS' */
 #define OHMYDSP_STATUS_VERSION  1u
 
+#define OHMYDSP_CAP_COHERENT_POSITION 1u
+
 enum { OHMYDSP_MEM_RING = 0, OHMYDSP_MEM_STATUS = 1 };
 enum { OHMYDSP_SEL_START = 0, OHMYDSP_SEL_STOP = 1, OHMYDSP_SEL_TUNE = 2, OHMYDSP_SEL_COUNT = 3 };
 enum { OHMYDSP_TUNE_INJECT = 1 };               /* 1 = stall the DMA once, 2 = stall it and refuse the next 3 restarts (fault injection) */
-enum { OHMYDSP_STATE_STOPPED = 0, OHMYDSP_STATE_RUNNING = 1, OHMYDSP_STATE_SILENT = 2 };   /* SILENT: recovery gave up, software clock, zeros */
+enum { OHMYDSP_STATE_STOPPED = 0, OHMYDSP_STATE_RUNNING = 1, OHMYDSP_STATE_SILENT = 2, OHMYDSP_STATE_ERROR = 3 };   /* SILENT: recovery gave up, software clock, zeros */
 
 struct OhMyDSPStatus {
     uint32_t magic, version;
@@ -32,4 +34,5 @@ struct OhMyDSPStatus {
     volatile uint64_t laps;                     /* completed laps of the ring since start */
     volatile uint64_t lapHostTime;              /* host time at which ring frame 0 of lap `laps` was written */
     volatile uint64_t faults, recoveries;
+    uint32_t capabilities;                      /* v1 extension in the formerly zero-filled page tail */
 };
