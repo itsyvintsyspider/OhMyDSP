@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Read-only decoder for ALSA ASoC topology (.tplg) files as used by SOF (IPC3).
+"""Read-only decoder for ALSA ASoC topology (.tplg) files as used by SOF IPC3 and IPC4.
 
 ABI: sof-linux/include/uapi/sound/asoc.h. Token names: include/uapi/sound/sof/tokens.h.
-Usage: python3 -I tools/tplg.py <file.tplg> [--tokens <tokens.h>] [widgets|routes|links|all]
+Usage: python3 -I tools/tplg.py <file.tplg> [--tokens <tokens.h>] [widgets|routes|dmic|all]
 Pure parser; no hardware access. Used by tools/gen-ipc3-dmic.py.
 """
 import re, struct, sys
@@ -109,7 +109,7 @@ def parse_graph(payload, count):
 
 def parse(path):
     data = open(path, "rb").read()
-    topo = dict(widgets=[], routes=[], raw_blocks=[], size=len(data))
+    topo = dict(widgets=[], routes=[], raw_blocks=[], size=len(data), magic=data[:4].decode("ascii", "replace"))
     for b in blocks(data):
         topo["raw_blocks"].append((b["type"], b["index"], b["count"], len(b["payload"]), b["vendor_type"]))
         if b["type"] == T_WIDGET:
@@ -150,6 +150,15 @@ def main():
     if what in ("routes", "all"):
         for r in topo["routes"]:
             print("ROUTE %r -> %r%s" % (r["source"], r["sink"], (" ctl=%r" % r["control"]) if r["control"] else ""))
+    if what == "dmic":
+        print("container=%s size=%d bytes" % (topo["magic"], topo["size"]))
+        for w in topo["widgets"]:
+            if "dmic" in w["name"].lower() or w["name"] in ("host-copier.6.capture", "pipeline.12"):
+                print("WIDGET id=%d name=%r sname=%r block=%d priv=%dB" %
+                      (w["id"], w["name"], w["sname"], w["block_index"], len(w["priv"])))
+        for r in topo["routes"]:
+            if "dmic" in (r["source"] + r["sink"]).lower() or "host-copier.6.capture" in (r["source"], r["sink"]):
+                print("ROUTE %r -> %r%s" % (r["source"], r["sink"], (" ctl=%r" % r["control"]) if r["control"] else ""))
 
 
 if __name__ == "__main__":
