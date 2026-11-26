@@ -10,7 +10,13 @@
 #include <os/log.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <unistd.h>
+#include "../diagnostics.h"
+#include "../clock.h"
 #include "../protocol.h"
+#include "../../include/OhMyDSPShared.h"
 
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "OhMyDSP driver: " fmt, ##__VA_ARGS__)
 
@@ -30,13 +36,91 @@ static UInt32 gIO;                                   // StartIO count
 static xpc_connection_t gConn;
 static const volatile struct OhMyDSPShm *gShm; static const uint8_t *gRing; static size_t gShmSize; static uint32_t gRingFrames;
 
+// Diagnostic recording never waits or logs on the audio/clock callbacks. Contention is counted.
+static struct OMDHalDiag gDiag;
+static atomic_flag gDiagLock=ATOMIC_FLAG_INIT;
+static atomic_uint_fast64_t gDiagSkipped;
+static atomic_bool gDiagEnabled;
+static uint64_t gDiagID, gKernelSession;
+static double gNsPerTick;
+static bool diagEnter(void) {
+    if(!atomic_load_explicit(&gDiagEnabled,memory_order_relaxed))return false;
+    if(!atomic_flag_test_and_set_explicit(&gDiagLock,memory_order_acquire)) {
+        if(atomic_load_explicit(&gDiagEnabled,memory_order_relaxed))return true;
+        atomic_flag_clear_explicit(&gDiagLock,memory_order_release);return false;
+    }
+    atomic_fetch_add_explicit(&gDiagSkipped,1,memory_order_relaxed);return false;
+}
+static void diagLeave(void){atomic_flag_clear_explicit(&gDiagLock,memory_order_release);}
+static void diagDump(void)
+{
+    // StopIO is outside the realtime callbacks; take a bounded snapshot, then format/log it.
+    struct OMDHalDiag copy; bool got=false;
+    for(unsigned i=0;i<100;i++) {
+        if(!atomic_flag_test_and_set_explicit(&gDiagLock,memory_order_acquire)){copy=gDiag;diagLeave();got=true;break;}
+        usleep(100);
+    }
+    char line[1024];
+    if(!got){LOG("diagnostic snapshot unavailable at stop");return;}
+    snprintf(line,sizeof(line),"{\"v\":1,\"source\":\"hal\",\"id\":%llu,\"kernel_session\":%llu,\"epoch\":%u,\"reads\":%llu,\"requested\":%llu,\"negative\":%llu,\"future\":%llu,\"stale\":%llu,\"state_frames\":%llu,\"snapshot_frames\":%llu,\"steady_missing\":%llu,\"clock_calls\":%llu,\"clock_snapshot_failures\":%llu,\"anchors\":%llu,\"clock_regressions\":%llu,\"max_anchor_residual_ns\":%.3f,\"events\":%u,\"dropped\":%u,\"skipped\":%llu}",
+        gDiagID,gKernelSession,copy.previous.epoch,copy.reads,copy.requested,copy.negative,copy.future,copy.stale,copy.stateFrames,copy.snapshotFrames,copy.steadyMissing,copy.clockCalls,copy.clockSnapshotFailures,copy.anchors,copy.clockRegressions,copy.maxAbsResidualNs,copy.count,copy.dropped,(uint64_t)atomic_load(&gDiagSkipped));
+    os_log(OS_LOG_DEFAULT,"OhMyDSP DIAG %{public}s",line);
+    for(unsigned i=0;i<copy.count;i++) {
+        const struct OMDHalEvent *e=&copy.events[i];
+        snprintf(line,sizeof(line),"{\"v\":1,\"source\":\"hal_event\",\"id\":%llu,\"index\":%u,\"kind\":%u,\"epoch\":%u,\"state\":%u,\"first\":%lld,\"frames\":%u,\"written\":%llu,\"laps\":%llu,\"host\":%llu,\"negative\":%llu,\"future\":%llu,\"stale\":%llu,\"residual_ns\":%.3f}",gDiagID,i,e->kind,e->p.epoch,e->p.state,e->first,e->frames,e->p.written,e->p.laps,e->p.host,e->negative,e->future,e->stale,e->residualNs);
+        os_log(OS_LOG_DEFAULT,"OhMyDSP DIAG %{public}s",line);
+    }
+}
+
 // ---------------------------------------------------------------- daemon link
+static atomic_uint gClockPeriod;
+
+static xpc_connection_t daemonConnection(void)
+{
+    xpc_connection_t c = xpc_connection_create_mach_service(OHMYDSP_MACH_SERVICE,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), 0);
+    if (c) {
+        xpc_connection_set_event_handler(c, ^(xpc_object_t event) { (void)event; });
+        xpc_connection_resume(c);
+    }
+    return c;
+}
+
+// Discover the period before advertising the device, including after delayed kext preparation.
+static void discoverClock(void)
+{
+    xpc_connection_t c = daemonConnection();
+    uint64_t period = 0;
+    if (c) {
+        xpc_object_t query = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_string(query, "cmd", "clock_info");
+        xpc_object_t reply = xpc_connection_send_message_with_reply_sync(c, query);
+        if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
+            xpc_dictionary_get_int64(reply, "status") == 0)
+            period = xpc_dictionary_get_uint64(reply, "period");
+        if (reply) xpc_release(reply);
+        xpc_release(query);
+        xpc_connection_cancel(c);
+        xpc_release(c);
+    }
+    if (!period || period > UINT32_MAX) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ discoverClock(); });
+        return;
+    }
+    atomic_store(&gClockPeriod, (UInt32)period);
+    AudioObjectPropertyAddress changed[] = {
+        {kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+        {kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain}
+    };
+    gHost->PropertiesChanged(gHost, kObjPlugIn, 2, changed);
+}
+
 static bool linkStart(void)
 {
-    gConn = xpc_connection_create_mach_service(OHMYDSP_MACH_SERVICE, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), 0);
+    if (!atomic_load(&gClockPeriod)) return false;
+    gConn = daemonConnection();
     if (!gConn) return false;
-    xpc_connection_set_event_handler(gConn, ^(xpc_object_t e) { (void)e; });
-    xpc_connection_resume(gConn);
     xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0); xpc_dictionary_set_string(m, "cmd", "start");
     xpc_object_t r = xpc_connection_send_message_with_reply_sync(gConn, m);
     bool ok = false;
@@ -45,13 +129,16 @@ static bool linkStart(void)
         void *region = NULL; size_t sz = sh ? xpc_shmem_map(sh, &region) : 0;
         if (sz >= OHMYDSP_SHM_HEADER && region) {
             const volatile struct OhMyDSPShm *h = region;
-            if (h->magic == OHMYDSP_SHM_MAGIC && h->channels == 2 && h->frameBytes == 8 && sz >= OHMYDSP_SHM_HEADER + h->ringBytes) {
+            if (h->magic == OHMYDSP_SHM_MAGIC && h->version == OHMYDSP_SHM_VERSION && h->clockPeriod == atomic_load(&gClockPeriod) && h->rate==kRate && h->ringBytes>=16384 && h->ringBytes%8==0 && h->channels == 2 && h->frameBytes == 8 && sz >= OHMYDSP_SHM_HEADER + h->ringBytes) {
+                gDiagID=xpc_dictionary_get_uint64(r,"diagnostic_id"); gKernelSession=xpc_dictionary_get_uint64(r,"kernel_session");
                 gShm = h; gRing = (const uint8_t *)region + OHMYDSP_SHM_HEADER; gShmSize = sz; gRingFrames = h->ringBytes / h->frameBytes; ok = true;
-            } else LOG("shared region has a bad header");
+            } else { vm_deallocate(mach_task_self(),(vm_address_t)region,sz); LOG("shared region has a bad header/version"); }
         } else LOG("no shared region in the reply (size %zu)", sz);
     } else if (xpc_get_type(r) == XPC_TYPE_ERROR) LOG("daemon unreachable: %s", xpc_dictionary_get_string(r, XPC_ERROR_KEY_DESCRIPTION));
     else LOG("daemon refused the start (status %lld)", (long long)xpc_dictionary_get_int64(r, "status"));
-    if (!ok) { xpc_connection_cancel(gConn); gConn = NULL; }
+    xpc_release(m);
+    xpc_release(r);
+    if (!ok) { xpc_connection_cancel(gConn); xpc_release(gConn); gConn = NULL; }
     return ok;
 }
 
@@ -59,8 +146,10 @@ static void linkStop(void)
 {
     if (!gConn) return;
     xpc_object_t m = xpc_dictionary_create(NULL, NULL, 0); xpc_dictionary_set_string(m, "cmd", "stop");
-    xpc_object_t r = xpc_connection_send_message_with_reply_sync(gConn, m); (void)r;
-    xpc_connection_cancel(gConn); gConn = NULL;
+    xpc_object_t r = xpc_connection_send_message_with_reply_sync(gConn, m);
+    xpc_release(r);
+    xpc_release(m);
+    xpc_connection_cancel(gConn); xpc_release(gConn); gConn = NULL;
     if (gShm) { vm_deallocate(mach_task_self(), (vm_address_t)gShm, gShmSize); gShm = NULL; gRing = NULL; }
 }
 
@@ -101,8 +190,8 @@ static OSStatus getProp(AudioObjectID obj, const AudioObjectPropertyAddress *a, 
         case kAudioObjectPropertyClass: return putU32(c, kAudioPlugInClassID);
         case kAudioObjectPropertyOwner: return putU32(c, kAudioObjectUnknown);
         case kAudioObjectPropertyManufacturer: return putCF(c, CFSTR("OhMyDSP"));
-        case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList: { UInt32 id = kObjDevice; return putIDs(c, &id, 1); }
-        case kAudioPlugInPropertyTranslateUIDToDevice: { UInt32 id = kObjDevice; return putU32(c, id); }   // only one device; the UID qualifier is not checked
+        case kAudioObjectPropertyOwnedObjects: case kAudioPlugInPropertyDeviceList: { UInt32 id = kObjDevice; return putIDs(c, &id, atomic_load(&gClockPeriod) ? 1 : 0); }
+        case kAudioPlugInPropertyTranslateUIDToDevice: { UInt32 id = atomic_load(&gClockPeriod) ? kObjDevice : kAudioObjectUnknown; return putU32(c, id); }   // only one device; the UID qualifier is not checked
         case kAudioPlugInPropertyResourceBundle: return putCF(c, CFSTR(""));
         }
         return UNKNOWN;
@@ -130,7 +219,13 @@ static OSStatus getProp(AudioObjectID obj, const AudioObjectPropertyAddress *a, 
         case kAudioDevicePropertyNominalSampleRate: return putF64(c, kRate);
         case kAudioDevicePropertyAvailableNominalSampleRates: { AudioValueRange r = { kRate, kRate }; return putBytes(c, &r, sizeof r); }
         case kAudioDevicePropertyIsHidden: return putU32(c, 0);
-        case kAudioDevicePropertyZeroTimeStampPeriod: return putU32(c, gRingFrames ? gRingFrames : 16384);
+        case kAudioDevicePropertyZeroTimeStampPeriod: return putU32(c, atomic_load(&gClockPeriod));
+        case kAudioDevicePropertyClockAlgorithm:
+#ifdef OHMYDSP_SMOOTH_CLOCK_EXPERIMENT
+            return putU32(c, kAudioDeviceClockAlgorithmRaw);
+#else
+            return putU32(c, kAudioDeviceClockAlgorithmSimpleIIR); // baseline host filtering of measured lap anchors
+#endif
         case kAudioDevicePropertyPreferredChannelsForStereo: { UInt32 ch[2] = { 1, 2 }; return putBytes(c, ch, sizeof ch); }
         }
         return UNKNOWN;
@@ -200,6 +295,8 @@ static ULONG Release(void *d) { (void)d; return 1; }
 static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef host)
 {
     (void)d; gHost = host;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ discoverClock(); });
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb); gNsPerTick=(double)tb.numer/tb.denom;
     setGainDb(kDbDefault);
     CFPropertyListRef v = NULL;
     if (host && host->CopyFromStorage(host, CFSTR("gainDb"), &v) == 0 && v) {
@@ -252,8 +349,20 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 
     if (dev != kObjDevice) return kAudioHardwareBadObjectError;
     OSStatus r = 0;
     pthread_mutex_lock(&gLock);
+    if(gIO==0) {
+        atomic_store(&gDiagEnabled,false);
+        bool reset=false;
+        for(unsigned attempt=0;attempt<100;attempt++) {
+            if(!atomic_flag_test_and_set_explicit(&gDiagLock,memory_order_acquire)) {
+                memset(&gDiag,0,sizeof(gDiag));atomic_store(&gDiagSkipped,0);diagLeave();reset=true;break;
+            }
+            usleep(100);
+        }
+        if(!reset){pthread_mutex_unlock(&gLock);return kAudioHardwareNotRunningError;}
+        gDiagID=gKernelSession=0;
+    }
     if (gIO == 0 && !linkStart()) r = kAudioHardwareNotRunningError;
-    else gIO++;
+    else { gIO++; atomic_store(&gDiagEnabled,true); }
     pthread_mutex_unlock(&gLock);
     LOG("StartIO -> %d (clients %u)", (int)r, (unsigned)gIO);
     return r;
@@ -263,22 +372,27 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 c
     (void)d; (void)client;
     if (dev != kObjDevice) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);
-    if (gIO > 0 && --gIO == 0) linkStop();
+    if (gIO > 0 && --gIO == 0) { atomic_store(&gDiagEnabled,false); linkStop(); diagDump(); }
     pthread_mutex_unlock(&gLock);
     LOG("StopIO (clients %u)", (unsigned)gIO);
     return 0;
 }
 
-// Zero time stamp = the start of the most recent lap of the DMA ring (sample time laps * ringFrames); the HAL extrapolates from it. The seed
-// changes on every DMA restart (recovery) so the HAL treats it as a discontinuity.
+// Export the daemon's clock pair with an immutable declared period. Ring geometry never changes the advertised period.
+// Only a hardware epoch change changes the seed; raw anchors remain available in diagnostic logs.
 static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client, Float64 *st, UInt64 *ht, UInt64 *seed)
 {
     (void)d; (void)dev; (void)client;
     const volatile struct OhMyDSPShm *h = gShm;
     if (!h) return kAudioHardwareNotRunningError;
-    uint32_t s1, s2, ep; uint64_t laps, t;
-    do { s1 = h->seq; laps = h->laps; t = h->lapHostTime; ep = h->epoch; s2 = h->seq; } while ((s1 & 1) || s1 != s2);
-    *st = (Float64)(laps * gRingFrames); *ht = t; *seed = (UInt64)ep + 1;
+    struct OMDPosition p;
+    if(!omdSnapshot(h,&p)) {
+        if(diagEnter()){gDiag.clockSnapshotFailures++;diagLeave();}
+        return kAudioHardwareNotRunningError;
+    }
+    if(diagEnter()){omdClock(&gDiag,&p,gRingFrames,gNsPerTick);diagLeave();}
+    if(!p.clockValid || (p.state!=OHMYDSP_STATE_RUNNING && p.state!=OHMYDSP_STATE_SILENT))return kAudioHardwareNotRunningError;
+    *st = (Float64)p.clockSample; *ht = p.clockHost; *seed = (UInt64)p.epoch + 1;
     return 0;
 }
 
@@ -296,8 +410,13 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, A
     (void)d; (void)dev; (void)stream; (void)client; (void)unused;
     if (op != kAudioServerPlugInIOOperationReadInput) return 0;
     float *dst = buf; const volatile struct OhMyDSPShm *h = gShm;
-    if (!h || !gRing) { memset(dst, 0, frames * 8); return 0; }
-    const int64_t first = (int64_t)ci->mInputTime.mSampleTime, written = (int64_t)h->written, rf = gRingFrames;
+    struct OMDPosition p={0};
+    bool snapshot=h && gRing && omdSnapshot(h,&p);
+    double sample=ci->mInputTime.mSampleTime;
+    if(!isfinite(sample) || sample < -1e15 || sample > 1e15) snapshot=false;
+    const int64_t first=snapshot?(int64_t)sample:0, written=(int64_t)p.written, rf=gRingFrames;
+    if(diagEnter()){omdRead(&gDiag,&p,first,frames,rf,snapshot);diagLeave();}
+    if(!snapshot || p.state!=1){memset(dst,0,frames*8);return 0;}
     const int32_t *ring = (const int32_t *)gRing;
     bool aAny = false, bAny = false;
     for (UInt32 i = 0; i < frames; i++) {                                                   // pass 1: which channel carries signal in this chunk
