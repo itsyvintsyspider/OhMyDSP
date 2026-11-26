@@ -17,3 +17,8 @@ __pycache__/
 !ohmydsp/data/dmic-p10.ipc
 # private helpers
 /tools/remove-old-dmicprobe.sh
+
+# Generated topology and mailbox reports from the RPL bring-up.
+/docs/rpl-ipc4-plan.json
+/docs/rpl-ipc4-messages.json
+/docs/rpl-ipc4-messages-live.json

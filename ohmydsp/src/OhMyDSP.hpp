@@ -7,6 +7,7 @@
 #include <libkern/c++/OSString.h>
 #include <stdarg.h>
 #include <kern/thread_call.h>
+#include <IOKit/IOLocks.h>
 
 class OhMyDSPAudioDevice;
 class OhMyDSPCapture;
@@ -19,15 +20,20 @@ class OhMyDSP : public IOService {
 public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
+    void free() override;
     void runProbe();
     void publishLog();
     OhMyDSPCapture *capture() const { return cap; }          // CORE variant: the capture session behind the user client (null until the DSP is prepared)
-    bool claimClient(OhMyDSPUserClient *c) { if (client) return false; client = c; return true; }
-    void releaseClient(OhMyDSPUserClient *c) { if (client == c) client = nullptr; }
+    bool claimClient(OhMyDSPUserClient *c);
+    void releaseClient(OhMyDSPUserClient *c);
+    void captureLog(const char *state, bool begin = false);
     static void dspLog(void *ctx, const char *fmt, ...);   // log sink for DSPDevice (same path as record())
 private:
     void record(const char *fmt, ...) __printflike(2, 3);
     OSArray *logBuf = nullptr;
+    bool logTruncated = false;
+    IOLock *stateLock = nullptr;
+    UInt32 sessionNumber = 0;
     thread_call_t tcall = nullptr;
     IOPCIDevice *pciDev = nullptr;
     OhMyDSPAudioDevice *audioDev = nullptr;   // Phase 5 audio device (boot-arg ohmydsp_audio=1 synthetic tone, =2 live DSP microphones)

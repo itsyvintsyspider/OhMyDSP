@@ -4,7 +4,6 @@ import PreferencePanes
 import UniformTypeIdentifiers
 import AppKit
 
-private enum Health { case ok, bad, idle }
 
 private final class StatusRow: NSStackView {
     let icon = NSImageView(), title: NSTextField, detail = NSTextField(labelWithString: "")
@@ -15,6 +14,8 @@ private final class StatusRow: NSStackView {
         icon.imageScaling = .scaleProportionallyDown
         icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
         detail.textColor = .secondaryLabelColor; detail.alignment = .right
+        detail.lineBreakMode = .byTruncatingTail
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         for v in [icon, title, spacer, detail] { addArrangedSubview(v) }
     }
@@ -44,6 +45,9 @@ private final class CardView: NSView {
 @objc(OhMyDSPPane)
 final class OhMyDSPPane: NSPreferencePane {
     private let kext = StatusRow("Kernel Extension"), service = StatusRow("Background Service"), driver = StatusRow("Audio Driver"), mic = StatusRow("Microphone")
+    private let sessionRow = StatusRow("DSP Session"), startupRow = StatusRow("Startup Loading")
+    private var refreshing = false
+    private var observing = false
     private let hardware = StatusRow("Hardware"), firmware = StatusRow("Firmware")
     private let progress = NSProgressIndicator(), progressLabel = NSTextField(labelWithString: "")
     private var download: FirmwareDownload?
@@ -62,7 +66,7 @@ final class OhMyDSPPane: NSPreferencePane {
 
     override func loadMainView() -> NSView {
         let content = NSStackView(views: [
-            section("Status", [kext, hardware, firmware, service, driver, mic]),
+            section("Status", [kext, hardware, firmware, service, driver, sessionRow, startupRow, mic]),
             section("Input", [volumeRow(), muteBox]),
             section("Setup", [buttonRow(), progressRow(), hint]),
             section("Misc", [logRow()])
@@ -70,7 +74,8 @@ final class OhMyDSPPane: NSPreferencePane {
         content.orientation = .vertical; content.alignment = .leading; content.spacing = 20
         content.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
         content.translatesAutoresizingMaskIntoConstraints = false
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 668, height: 650))
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 700))
+        root.autoresizingMask = [.width]
         root.addSubview(content)
         NSLayoutConstraint.activate([content.topAnchor.constraint(equalTo: root.topAnchor), content.leadingAnchor.constraint(equalTo: root.leadingAnchor), content.trailingAnchor.constraint(equalTo: root.trailingAnchor)])
         for sec in content.arrangedSubviews { sec.widthAnchor.constraint(equalTo: content.widthAnchor, constant: -40).isActive = true }
@@ -89,7 +94,10 @@ final class OhMyDSPPane: NSPreferencePane {
 
     override func mainViewDidLoad() { refresh() }
     override func willSelect() {
-        refresh(); DMICAudio.observe { [weak self] in self?.refresh() }
+        refresh()
+        if !observing {
+            DMICAudio.observe { [weak self] in self?.refresh() }; observing = true
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
     }
     override func didUnselect() { timer?.invalidate(); timer = nil }
@@ -135,9 +143,22 @@ final class OhMyDSPPane: NSPreferencePane {
 
     // MARK: state
     private func refresh() {
-        let loaded = DMICSystem.kextLoaded(), dev = DMICAudio.device()
+        guard !refreshing else { return }
+        refreshing = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let snapshot = DMICStatus.read()
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.refreshing = false
+                self.render(snapshot)
+            }
+        }
+    }
+
+    private func render(_ snapshot: DMICStatus) {
+        let loaded = snapshot.bundle != nil, dev = DMICAudio.device()
         kext.set(loaded ? .ok : .bad, loaded ? "Loaded" : "Not loaded")
-        service.set(DMICSystem.daemonRunning ? .ok : DMICSystem.daemonInstalled ? .bad : .idle, DMICSystem.daemonRunning ? "Running" : DMICSystem.daemonInstalled ? "Not running" : "Not installed")
+        service.set(snapshot.daemon ? .ok : DMICSystem.daemonInstalled ? .bad : .idle, snapshot.daemon ? "Running" : DMICSystem.daemonInstalled ? "Not running" : "Not installed")
         driver.set(dev != nil ? .ok : DMICSystem.driverInstalled ? .idle : .idle, dev != nil ? "Active" : DMICSystem.driverInstalled ? "Installed" : "Not installed")
         if let d = dev {
             mic.set(.ok, DMICAudio.running(d) ? "In use" : "Ready")
@@ -149,18 +170,36 @@ final class OhMyDSPPane: NSPreferencePane {
         }
         let installed = DMICSystem.driverInstalled || DMICSystem.daemonInstalled
         let plat = DMICPlatform.detect(), fw = DMICFirmware.installed, downloading = download != nil
+        let rpl = plat?.device == 0x51ca || snapshot.isSession
+        sessionRow.isHidden = !rpl; startupRow.isHidden = !rpl
         if let p = plat {
             hardware.set(p.verdict == .supported ? .ok : p.verdict == .notYet || p.verdict == .unknown ? .idle : .bad,
                          p.verdict == .supported ? p.name : p.verdict == .dspOff ? "DSP off in firmware setup" : p.verdict == .noSOF ? "\(p.name): no SOF firmware" : "\(p.name): not supported yet")
-            hardware.toolTip = "\(p.cpu)\nPCI \(p.pciID), class 0x\(String(p.pciClass, radix: 16))"
+            hardware.toolTip = "\(p.cpu)\nPCI \(p.pciID), class 0x\(String(p.pciClass, radix: 16))" + (p.profileSummary.map { "\n\($0)" } ?? "")
         } else { hardware.set(.bad, "No Intel audio controller"); hardware.toolTip = nil }
         firmware.set(fw ? .ok : .idle, fw ? "Installed" : downloading ? "Downloading…" : "Not installed")
         installButton.title = installed ? "Reinstall…" : "Install…"
-        installButton.isEnabled = !busy && !downloading && plat?.verdict == .supported; uninstallButton.isEnabled = installed && !busy && !downloading
+        let actions = setupActions(plat, session: snapshot.isSession, installed: installed)
+        installButton.isEnabled = actions.install
+        uninstallButton.isEnabled = actions.uninstall
         hint.stringValue = plat == nil ? "No Intel audio controller was found." : plat?.problem ??
             (!loaded ? "The kernel extension is loaded at boot by OpenCore: add OhMyDSP.kext to Kernel > Add, after Lilu, and restart." :
              !fw || !installed ? "Install… downloads the SOF firmware if needed (17 MB, checked), then installs the background service and the audio driver." :
              dev == nil && restartHint ? "Restart your Mac once so the kernel extension can load the firmware." : "")
+        if rpl {
+            kext.set(snapshot.kernelStatus.health, snapshot.kernelStatus.text)
+            if let p = plat {
+                hardware.set(p.verdict == .dspOff ? .bad : .idle,
+                             p.verdict == .dspOff ? "DSP off in firmware setup" : "Raptor Lake · experimental IPC4")
+            }
+            firmware.set(snapshot.assets.health, snapshot.assets.text)
+            sessionRow.set(snapshot.sessionStatus.health, snapshot.sessionStatus.text)
+            startupRow.set(snapshot.startup.health, snapshot.startup.text)
+            startupRow.toolTip = snapshot.startupLog ?? "/Library/Logs/OhMyDSP/startup-launch.log"
+            mic.set(snapshot.microphoneStatus.health, snapshot.microphoneStatus.text)
+            driver.set(snapshot.visible ? .ok : .bad, snapshot.visible ? "Visible to CoreAudio" : "Not visible")
+            hint.stringValue = "RPL setup is managed by the RPL tools. Ready means the capture path is available; use recording diagnostics to check audio continuity."
+        }
         hint.isHidden = hint.stringValue.isEmpty
     }
 
@@ -191,8 +230,19 @@ final class OhMyDSPPane: NSPreferencePane {
     }
 
     // MARK: install / uninstall (standard administrator prompt)
+    private func setupActions(_ platform: DMICPlatform? = DMICPlatform.detect(),
+                              session: Bool = DMICStatus.read().isSession,
+                              installed: Bool = DMICSystem.driverInstalled || DMICSystem.daemonInstalled)
+                              -> (install: Bool, uninstall: Bool) {
+        let markers = ["/Library/Application Support/OhMyDSP/rpl", "/Library/Application Support/OhMyDSP/startup",
+                       "/Library/LaunchDaemons/com.ohmydsp.startup.plist"]
+        return DMICPlatform.setupActions(platform: platform, session: session,
+                                         rplFiles: markers.contains(where: FileManager.default.fileExists(atPath:)),
+                                         installed: installed, busy: busy || download != nil)
+    }
+
     @objc private func install() {
-        guard download == nil else { return }
+        guard setupActions().install else { return }
         if DMICFirmware.installed { runSetup(arg: "", firmware: nil); return }
         progress.doubleValue = 0; progressLabel.stringValue = "Downloading firmware…"; progressBox?.isHidden = false
         download = FirmwareDownload(progress: { [weak self] f in self?.progress.doubleValue = f; self?.progressLabel.stringValue = "Downloading… \(Int(f * 100))%" },
@@ -210,7 +260,8 @@ final class OhMyDSPPane: NSPreferencePane {
     }
     @objc private func uninstall() { runSetup(arg: "uninstall", firmware: nil) }
     private func runSetup(arg: String, firmware: URL?) {
-        guard !busy, let res = Bundle(for: OhMyDSPPane.self).resourcePath else { return }
+        let actions = setupActions()
+        guard (arg == "uninstall" ? actions.uninstall : actions.install), let res = Bundle(for: OhMyDSPPane.self).resourcePath else { return }
         busy = true; refresh()
         let fw = firmware.map { "FIRMWARE_DIR='\($0.path)' FIRMWARE_SHA256='\(DMICFirmware.sha256)' " } ?? ""
         let cmd = "\(fw)PAYLOAD='\(res)' /bin/sh '\(res)/install-userspace.sh' \(arg)"
